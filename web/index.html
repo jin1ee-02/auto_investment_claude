@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hedge Insight</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#/funds"><span class="brand-mark"></span>Hedge Insight</a>
+  <nav id="nav">
+    <a href="#/funds" data-tab="funds"><b>1</b> 펀드</a>
+    <a href="#/consensus" data-tab="consensus"><b>2</b> 공통 매매</a>
+    <a href="#/research" data-tab="research"><b>3</b> 리서치</a>
+    <a href="#/trade" data-tab="trade"><b>4</b> 매매</a>
+  </nav>
+  <div class="top-right">
+    <label class="period">분기 <select id="period"></select></label>
+    <button id="refresh" class="btn ghost" title="새 13F 공시 확인">공시 새로고침</button>
+  </div>
+</header>
+<div id="banner" class="banner" hidden></div>
+<main id="view"></main>
+<div id="toast" class="toast" hidden></div>
+<div id="modal" class="modal" hidden></div>
+<script src="vendor/echarts.min.js"></script>
+<script src="vendor/marked.min.js"></script>
+<script src="vendor/purify.min.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>
