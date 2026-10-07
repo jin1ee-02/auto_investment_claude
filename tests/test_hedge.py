@@ -39,6 +39,8 @@ class SourcesTest(Base):
         self.assertEqual(sources.quarter_end('2025-12-31'), '2025-12-31')
         self.assertEqual(sources.previous_period(Q2), Q1)
         self.assertEqual(sources.previous_period(Q1), '2025-12-31')
+        self.assertEqual(sources.previous_period('2025-12-31'), '2025-09-30')
+        self.assertEqual(sources.previous_period('2026-09-30'), Q2)
         self.assertEqual(sources.period_label(Q2), '2026 Q2')
 
     def test_edgar_information_table(self):
@@ -66,6 +68,26 @@ class SourcesTest(Base):
             f(Q1, 'c', '13F-HR', '2026-05-15', 90), f(Q1, 'd', '13F-HR/A', '2026-05-30', 92),      # full restatement
             f('2025-12-31', 'e', '13F-HR', '2026-02-14', 80)], 2)
         self.assertEqual([c.accession for c in chosen], ['a', 'd'])
+
+    def test_13finfo_listing_labels_amendments(self):
+        def row(period, acc, form, filed, count):
+            return (f'<tr class="x"><td class="px-3 py-2 text-center" data-order="{period}">\n<a href="/13f/{acc}-fund-q">Q</a></td>'
+                    f'<td class="px-3 py-2 text-right">{count}</td><td class="px-3 py-2 text-right">1,234</td>'
+                    f'<td class="px-3 py-2 truncate group" title="AAPL, KO">AAPL, KO</td>'
+                    f'<td class="px-3 py-2 text-center truncate" title="{form}">{form}</td>'
+                    f'<td class="px-3 py-2 text-right" data-order="{filed}">x</td><td>{acc}</td></tr>')
+        a, b, c, d = ('%018d' % n for n in (1, 2, 3, 4))
+        html = ('<h1 class="t">Fund  LLC</h1><table id="managerFilings"><thead><tr><th>Quarter</th></tr></thead><tbody>'
+                + row(Q2, a, '13F-HR', '2026-08-14', '1,000') + row(Q1, b, 'RESTATEMENT', '2026-06-01', 52)
+                + row(Q1, c, 'NEW HOLDINGS', '2026-06-01', 40) + row('2025-12-31', d, 'NEW HOLDINGS', '2026-03-01', 4)
+                + '</tbody></table>')
+        name, filings = sources.INFO.parse_manager('1', html)
+        self.assertEqual(name, 'Fund LLC')
+        self.assertEqual([(f.accession, f.form, f.partial, f.count) for f in filings],
+                         [(a, '13F-HR', False, 1000), (b, '13F-HR/A', False, 52), (c, '13F-HR/A', True, 40), (d, '13F-HR/A', True, 4)])
+        chosen = sources.pick_filings(filings, 3)             # additions are never a period's table
+        self.assertEqual([f.accession for f in chosen], [a, b])
+        self.assertEqual([f.accession for f in sources.additions(filings, chosen[1])], [c])
 
     def test_canonical_ticker_is_stable_across_sources(self):
         row = {'cusip': 'X1', 'name': 'A', 'cls': '', 'kind': '', 'value': 1.0, 'shares': 1.0}

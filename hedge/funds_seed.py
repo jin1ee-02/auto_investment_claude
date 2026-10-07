@@ -39,6 +39,12 @@ FEATURED = [
     ('1045810', 'Nvidia', 'Jensen Huang', '기업 투자 포트폴리오'),
 ]
 
+# A manager that started filing under a new CIK: quarters the old filer reported are added to
+# the new one's, so the first quarter after the switch is not read as a wave of new buys.
+PREDECESSORS = {
+    '2026053': ('1336528',),     # Pershing Square Inc. <- Pershing Square Capital Management, L.P. (through 2026 Q1)
+}
+
 DEFAULT_SELECTION = ['1067983', '1536411', '2026053', '1656456', '1040273', '1135730', '1061165', '1103804']
 
 
