@@ -38,11 +38,23 @@ function toast(msg, ms = 3500) {
 }
 const guard = (fn) => async (...a) => { try { return await fn(...a); } catch (e) { toast(e.message, 6000); } };
 function modal(html) {
-  const m = $('#modal'); m.innerHTML = `<div class="box">${html}</div>`; m.hidden = false;
+  const m = $('#modal'); modal.opener = document.activeElement;
+  m.innerHTML = `<div class="box" role="dialog" aria-modal="true" aria-labelledby="modal-title" tabindex="-1">${html}</div>`; m.hidden = false;
   m.onclick = (e) => { if (e.target === m) closeModal(); };
-  return m.firstElementChild;
+  const box = m.firstElementChild;
+  box.querySelector('h2')?.setAttribute('id', 'modal-title');
+  (box.querySelector('[autofocus]') || box).focus();
+  return box;
 }
-const closeModal = () => { $('#modal').hidden = true; $('#modal').innerHTML = ''; };
+const closeModal = () => { $('#modal').hidden = true; $('#modal').innerHTML = ''; modal.opener?.focus?.(); };
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('#modal').hidden) $('#modal').querySelector('#no, #close')?.click(); });
+// Rows that act on click also answer Enter/Space, so the tables work from the keyboard.
+function rowKeys(root) {
+  root.querySelectorAll('tr.click').forEach((tr) => {
+    tr.tabIndex = 0;
+    tr.onkeydown = (e) => { if ((e.key === 'Enter' || e.key === ' ') && e.target === tr) { e.preventDefault(); tr.click(); } };
+  });
+}
 function ratingTag(r) {
   if (!r) return '';
   if (r.status === 'done') return `<a class="tag ${r.rating}" href="#/research/${r.id}" title="리서치 보고서 열기">${RATING[r.rating] || r.rating}</a>`;
@@ -52,7 +64,7 @@ function ratingTag(r) {
 function disposeCharts() { state.charts.forEach((c) => c.dispose()); state.charts = []; }
 function chart(el, option) {
   const c = echarts.init(el, null, { renderer: 'canvas' });
-  c.setOption(option); state.charts.push(c); return c;
+  c.setOption({ textStyle: { fontFamily: css('--font') }, ...option }); state.charts.push(c); return c;
 }
 window.addEventListener('resize', () => state.charts.forEach((c) => c.resize()));
 
@@ -109,7 +121,9 @@ async function route() {
   const [, tab = 'funds', arg] = location.hash.split('/');
   document.querySelectorAll('#nav a').forEach((a) => a.classList.toggle('on', a.dataset.tab === (tab === 'fund' ? 'funds' : tab)));
   const pages = { funds: pageFunds, fund: pageFund, consensus: pageConsensus, research: arg ? pageReport : pageResearch, trade: pageTrade };
+  view.setAttribute('aria-busy', 'true');
   try { await (pages[tab] || pageFunds)(arg); } catch (e) { view.innerHTML = `<div class="card empty">${esc(e.message)}</div>`; }
+  finally { view.removeAttribute('aria-busy'); rowKeys(view); }
 }
 window.addEventListener('hashchange', route);
 
@@ -139,15 +153,17 @@ async function pageFunds() {
     <div class="head">
       <div><h1>펀드</h1><div class="sub">${esc(data.periodLabel)} 분기 말 13F 보유 내역 · 직전 분기와 비교해 무엇을 사고 팔았는지 봅니다</div></div>
       <div class="right">
-        <select id="sort">
+        <select id="sort" aria-label="정렬 기준">
           <option value="featured">기본 순서</option><option value="aum">운용 규모순</option>
           <option value="ret">추정 분기 수익률순</option><option value="turnover">회전율순</option><option value="conc">집중도순</option>
         </select>
         <button class="btn" id="add">+ 기관 추가</button>
-        <a class="btn primary" href="#/consensus">선택한 ${state.selection.length}개 펀드의 공통 매매 →</a>
+        <a class="btn primary" href="#/consensus">선택한 ${state.selection.length}개 펀드의 공통 매매 보기</a>
       </div>
     </div>
-    <div class="grid fund-grid">${funds.map(fundCard).join('')}</div>
+    <div class="card ledger">
+      <div class="ledger-head"><span></span><span>운용사</span><span class="n">13F 평가액</span><span class="n">종목 수</span><span class="n">추정 수익률</span><span class="wide">상위 5개 비중</span><span class="wide n">이번 분기 매매</span></div>
+      ${funds.map(fundCard).join('')}</div>
     <p class="note" style="margin-top:16px">추정 분기 수익률은 <b>직전 분기 말 주식 보유분을 그대로 들고 있었을 때</b>의 수익률입니다(13F 평가액÷주식 수로 역산한 분기 말 가격 기준).
     분기 중 매매·공매도·옵션·현금은 반영되지 않으므로 펀드의 실제 성과가 아닙니다. 목록은 편집된 유명 펀드 목록이며 순위가 아닙니다.</p>`;
   $('#sort').value = fundSort;
@@ -158,38 +174,36 @@ async function pageFunds() {
     state.selection = box.checked ? [...state.selection, cik] : state.selection.filter((c) => c !== cik);
     box.closest('.fund').classList.toggle('sel', box.checked);
     await saveSelection();
-    $('.head .btn.primary').textContent = `선택한 ${state.selection.length}개 펀드의 공통 매매 →`;
+    $('.head .btn.primary').textContent = `선택한 ${state.selection.length}개 펀드의 공통 매매 보기`;
   }));
 }
 function fundCard(f) {
   const sel = state.selection.includes(f.cik);
+  const box = `<input type="checkbox" data-cik="${f.cik}" ${sel ? 'checked' : ''} title="공통 매매 분석에 포함" aria-label="${esc(f.name)} 공통 매매 분석에 포함">`;
   if (!f.hasData) {
-    return `<div class="card fund ${sel ? 'sel' : ''}"><div class="fund-top"><input type="checkbox" data-cik="${f.cik}" ${sel ? 'checked' : ''}>
-      <div><a class="fund-name" href="#/fund/${f.cik}">${esc(f.name)}</a><div class="fund-meta">${esc(f.manager || '')}</div></div></div>
-      <div class="faint small">${f.periods.length ? `이 분기 공시 없음 · 보유 분기: ${f.periods.join(', ')}` : esc(f.last_error || '공시를 아직 가져오지 않았습니다')}</div></div>`;
+    return `<div class="fund ${sel ? 'sel' : ''}">${box}
+      <div class="fund-id"><a class="fund-name" href="#/fund/${f.cik}">${esc(f.name)}</a><div class="fund-meta">${esc(f.manager || '')}</div></div>
+      <div class="gap faint small">${f.periods.length ? `이 분기 공시 없음 · 보유 분기: ${f.periods.join(', ')}` : esc(f.last_error || '공시를 아직 가져오지 않았습니다')}</div></div>`;
   }
   const rest = Math.max(0, 100 - f.top.reduce((s, t) => s + t.weight, 0));
   const bar = f.top.map((t, i) => `<i style="width:${t.weight}%;background:var(${SERIES[i]})" title="${esc(t.label)} ${t.weight.toFixed(1)}%"></i>`).join('') + `<i style="width:${rest}%;background:var(--s-other)" title="기타 ${rest.toFixed(1)}%"></i>`;
   const c = f.counts;
-  return `<div class="card fund ${sel ? 'sel' : ''}">
-    <div class="fund-top"><input type="checkbox" data-cik="${f.cik}" ${sel ? 'checked' : ''} title="공통 매매 분석에 포함">
-      <div style="min-width:0"><a class="fund-name" href="#/fund/${f.cik}">${esc(f.name)}</a>
-      <div class="fund-meta">${esc([f.manager, f.style].filter(Boolean).join(' · '))}</div></div></div>
-    <div class="fund-stats">
-      <div class="stat"><b>${fmtUsd(f.totalValue)}</b><span>13F 평가액</span></div>
-      <div class="stat"><b>${fmtNum(f.positions)}</b><span>종목 수</span></div>
-      <div class="stat"><b>${f.copyReturn ? signed(f.copyReturn.returnPct) : '–'}</b><span>추정 분기 수익률</span></div>
-    </div>
-    <div><div class="minibar">${bar}</div>
-      <div class="minilegend" style="margin-top:6px">${f.top.map((t, i) => `<span><i style="background:var(${SERIES[i]})"></i>${esc(t.label)} ${t.weight.toFixed(0)}%</span>`).join('')}</div></div>
-    <div class="acts">${f.turnover == null ? '<span class="faint">직전 분기 공시가 없어 변화를 계산할 수 없습니다</span>' : `
+  return `<div class="fund ${sel ? 'sel' : ''}">${box}
+    <div class="fund-id"><a class="fund-name" href="#/fund/${f.cik}">${esc(f.name)}</a>
+      <div class="fund-meta">${esc([f.manager, f.style].filter(Boolean).join(' · '))}</div></div>
+    <div class="n"><span class="lbl">13F 평가액</span>${fmtUsd(f.totalValue)}</div>
+    <div class="n"><span class="lbl">종목 수</span>${fmtNum(f.positions)}</div>
+    <div class="n"><span class="lbl">추정 수익률</span>${f.copyReturn ? signed(f.copyReturn.returnPct) : '–'}</div>
+    <div class="alloc"><div class="minibar">${bar}</div>
+      <div class="minilegend">${f.top.map((t, i) => `<span><i style="background:var(${SERIES[i]})"></i>${esc(t.label)} ${t.weight.toFixed(0)}%</span>`).join('')}</div></div>
+    <div class="acts">${f.turnover == null ? '<span class="faint">직전 분기 공시 없음</span>' : `
       <span class="tag new">신규 ${c.new}</span><span class="tag add">확대 ${c.add}</span><span class="tag reduce">축소 ${c.reduce}</span><span class="tag exit">청산 ${c.exit}</span>
       <span class="tag" title="비중 변화 절댓값 합의 절반">회전 ${f.turnover.toFixed(0)}%</span>`}</div>
   </div>`;
 }
 function addFundDialog() {
   const box = modal(`<h2>기관 추가</h2><p class="muted small">운용사 이름으로 검색하거나 SEC CIK 번호를 입력하세요. 13F 공시가 확인된 기관만 추가됩니다.</p>
-    <input type="text" id="q" placeholder="예: Greenoaks, Baillie Gifford, 1067983" autofocus>
+    <input type="text" id="q" name="fund-search" aria-label="운용사 이름 또는 CIK" placeholder="예: Greenoaks, Baillie Gifford, 1067983…" autocomplete="off" spellcheck="false" autofocus>
     <div class="search-results" id="results"></div><div style="text-align:right"><button class="btn" id="close">닫기</button></div>`);
   $('#close', box).onclick = closeModal;
   let t;
@@ -228,7 +242,7 @@ async function pageFund(cik, period) {
         <div class="sub">${esc([d.fund.manager, d.fund.style].filter(Boolean).join(' · '))} · 공시일 ${esc(s.filedAt || '–')} ·
         <a href="${esc(s.sourceUrl || '#')}" target="_blank" rel="noopener" style="text-decoration:underline">${esc(s.source)} 원문</a></div></div>
       <div class="right">
-        <select id="fperiod">${d.periods.map((p) => `<option value="${p.period}" ${p.period === d.period ? 'selected' : ''}>${p.label}</option>`).join('')}</select>
+        <select id="fperiod" aria-label="분기">${d.periods.map((p) => `<option value="${p.period}" ${p.period === d.period ? 'selected' : ''}>${p.label}</option>`).join('')}</select>
         <label class="chip"><input type="checkbox" id="fsel" ${sel ? 'checked' : ''}> 공통 매매 분석에 포함</label>
         ${d.fund.featured ? '' : '<button class="btn sm" id="fdel">삭제</button>'}
       </div>
@@ -327,7 +341,7 @@ async function pageConsensus() {
         <select id="minc">${[0, 1, 5, 10, 25].map((v) => `<option value="${v}" ${v === minChange ? 'selected' : ''}>${v === 0 ? '제한 없음' : v + '% 이상'}</option>`).join('')}</select></label>
         <a class="btn" href="#/funds">펀드 다시 고르기</a></div>
     </div>
-    <div class="chips" style="margin-bottom:12px">${state.selection.map((c) => `<span class="chip">${esc(names[c] || c)}<button data-cik="${c}" title="선택 해제">✕</button></span>`).join('')}</div>
+    <div class="chips" style="margin-bottom:12px">${state.selection.map((c) => `<span class="chip">${esc(names[c] || c)}<button data-cik="${c}" title="선택 해제" aria-label="${esc(names[c] || c)} 선택 해제">✕</button></span>`).join('')}</div>
     ${d.missing.length ? `<div class="note warn" style="margin-bottom:12px">비교에서 제외됨: ${d.missing.map((m) => `${esc(m.name)} (${esc(m.reason)})`).join(' · ')}</div>` : ''}
     ${n < 2 ? '<div class="note warn" style="margin-bottom:12px">겹침을 보려면 비교 가능한 펀드가 2개 이상 필요합니다.</div>' : ''}
     <div class="card pad" style="margin-bottom:12px"><div style="display:flex;gap:12px;align-items:baseline;margin-bottom:8px"><h2>겹침 지도</h2><span class="faint small">가장 많이 겹친 종목 × 펀드 · N 신규 / + 확대 / − 축소 / X 청산 / · 유지</span></div>
@@ -337,15 +351,15 @@ async function pageConsensus() {
       <div class="card"><div class="pad"><h2><span class="neg">▼</span> 공통 매도 <span class="faint small">${d.sellTotal}종목 중 상위 ${d.sells.length}</span></h2></div><div class="table-wrap" style="max-height:720px">${consTable(d.sells, 'sell', n)}</div></div>
     </div>
     <div class="card sticky-bar"><b id="pickn"></b><span class="muted small">체크한 종목을 TradingAgents 로 리서치합니다. 종목당 수 분이 걸리고 LLM API 비용이 발생합니다.</span>
-      <button class="btn" id="clear" style="margin-left:auto">선택 해제</button><button class="btn primary" id="go">리서치 시작 →</button></div>`;
+      <button class="btn" id="clear" style="margin-left:auto">선택 해제</button><button class="btn primary" id="go">리서치 시작</button></div>`;
   const all = Object.fromEntries([...d.buys, ...d.sells].map((r) => [r.key, r]));
   const sync = () => { $('#pickn').textContent = `${state.picked.size}종목 선택`; $('#go').disabled = !state.picked.size; view.querySelectorAll('input[data-pick]').forEach((b) => (b.checked = state.picked.has(b.dataset.pick))); };
   view.querySelectorAll('input[data-pick]').forEach((b) => b.onchange = () => { b.checked ? state.picked.add(b.dataset.pick) : state.picked.delete(b.dataset.pick); sync(); });
   view.querySelectorAll('tr[data-key]').forEach((tr) => tr.onclick = (e) => {
     if (e.target.closest('input,a,button')) return;
     const next = tr.nextElementSibling;
-    if (next?.classList.contains('detail-row')) { next.remove(); return; }
-    const r = all[tr.dataset.key];
+    if (next?.classList.contains('detail-row')) { next.remove(); tr.setAttribute('aria-expanded', 'false'); return; }
+    const r = all[tr.dataset.key]; tr.setAttribute('aria-expanded', 'true');
     tr.insertAdjacentHTML('afterend', `<tr class="detail-row"><td colspan="7"><table><thead><tr><th>펀드</th><th>변화</th><th class="r">주식 수 변화</th><th class="r">비중</th><th class="r">비중 변화</th><th class="r">추정 매매액</th></tr></thead><tbody>
       ${r.funds.map((f) => `<tr><td><a href="#/fund/${f.cik}" style="text-decoration:underline">${esc(f.fund)}</a></td><td><span class="tag ${f.action}">${ACTION[f.action]}</span></td>
       <td class="r">${f.action === 'new' ? '<span class="pos">신규</span>' : signed(f.changePct)}</td><td class="r">${fmtPct(f.weight, 2)}</td><td class="r">${signed(f.weightDelta, 2, '%p')}</td>
@@ -370,8 +384,8 @@ function consTable(rows, side, n) {
     ${rows.map((r) => {
       const count = side === 'buy' ? r.buyCount : r.sellCount, other = side === 'buy' ? r.sellCount : r.buyCount;
       const dotHtml = Array.from({ length: Math.min(n, 12) }, (_, i) => `<i class="${i < count ? (side === 'buy' ? 'b' : 's') : ''}"></i>`).join('');
-      return `<tr class="click" data-key="${esc(r.key)}">
-        <td>${r.researchable ? `<input type="checkbox" data-pick="${esc(r.ticker)}">` : ''}</td>
+      return `<tr class="click" data-key="${esc(r.key)}" aria-expanded="false" title="펀드별 내역 펼치기">
+        <td>${r.researchable ? `<input type="checkbox" data-pick="${esc(r.ticker)}" aria-label="${esc(r.ticker)} 리서치 대상에 포함">` : ''}</td>
         <td><span class="tk">${esc(r.ticker || r.cusip)}</span><div class="nm" title="${esc(r.name)}">${esc(r.name)}</div></td>
         <td><b class="num">${count}</b><span class="faint">/${n}</span> <span class="dots">${dotHtml}</span>${other ? `<div class="faint small">반대로 ${side === 'buy' ? '매도' : '매수'} ${other}곳</div>` : ''}</td>
         <td class="r">${(side === 'buy' ? r.newCount : r.exitCount) || '–'}</td>
@@ -400,12 +414,12 @@ async function pageResearch() {
   const c = d.config, active = d.jobs.some((j) => j.status === 'queued' || j.status === 'running');
   view.innerHTML = `
     <div class="head"><div><h1>리서치</h1><div class="sub">TradingAgents 의 분석가 4명 → 강세·약세 토론 → 트레이더 → 리스크 토론 → 포트폴리오 매니저가 5단계 등급을 냅니다</div></div>
-      <div class="right"><input type="text" id="tickers" placeholder="티커 직접 입력 (예: NVDA, AMZN)" style="width:240px"><button class="btn primary" id="run">리서치</button></div></div>
+      <div class="right"><input type="text" id="tickers" name="tickers" aria-label="리서치할 티커" placeholder="티커 직접 입력 (예: NVDA, AMZN…)" autocomplete="off" spellcheck="false" style="width:240px"><button class="btn primary" id="run">리서치</button></div></div>
     <div class="note ${c.ready ? '' : 'warn'}" style="margin-bottom:12px">${c.ready ? `모델: <b>${esc(c.provider)}</b> · 심층 ${esc(c.deepModel)} · 빠른 ${esc(c.quickModel)} · 토론 ${c.debateRounds}회 / 리스크 ${c.riskRounds}회 · 한 번에 한 종목씩 순서대로 실행 · 같은 종목은 14일간 결과 재사용`
       : '.env 에 RESEARCH_PROVIDER / RESEARCH_DEEP_MODEL / RESEARCH_QUICK_MODEL 과 해당 API 키를 설정하고 서버를 다시 시작하세요.'}</div>
     <div class="card"><div class="table-wrap"><table><thead><tr><th>종목</th><th>상태</th><th>등급</th><th>13F 근거</th><th>분석 기준일</th><th>완료</th><th></th></tr></thead><tbody>
     ${d.jobs.map((j) => `<tr class="${j.status === 'done' || j.reports ? 'click' : ''}" data-id="${j.id}" data-status="${j.status}">
-      <td><span class="tk">${esc(j.ticker)}</span><div class="nm">${esc(j.context?.name || '')}</div></td>
+      <td>${j.status === 'done' || j.reports ? `<a class="tk" href="#/research/${j.id}">${esc(j.ticker)}</a>` : `<span class="tk">${esc(j.ticker)}</span>`}<div class="nm">${esc(j.context?.name || '')}</div></td>
       <td><span class="tag ${j.status}">${JOB[j.status]}</span> <span class="small muted">${esc(j.status === 'running' ? j.stage : '')}</span>${j.status === 'error' ? `<div class="small faint" style="max-width:420px;white-space:pre-wrap">${esc((j.error || '').slice(0, 300))}</div>` : ''}</td>
       <td>${j.rating ? `<span class="tag ${j.rating}">${RATING[j.rating]} · ${j.rating}</span>` : '–'}</td>
       <td class="small muted">${j.context ? `${esc(j.context.period)} · ${j.context.fundCount}곳 중 매수 ${j.context.buyCount} / 매도 ${j.context.sellCount}` : '직접 입력'}</td>
@@ -413,7 +427,7 @@ async function pageResearch() {
       <td class="r">${j.status === 'queued' || j.status === 'running' ? `<button class="btn sm" data-cancel="${j.id}">취소</button>` : `<button class="btn sm" data-redo="${esc(j.ticker)}">다시</button> <button class="btn sm" data-del="${j.id}">삭제</button>`}</td></tr>`).join('')
       || '<tr><td colspan="7" class="empty">아직 리서치가 없습니다. <a href="#/consensus" style="text-decoration:underline">공통 매매</a>에서 종목을 골라 시작하세요.</td></tr>'}
     </tbody></table></div></div>
-    <div style="margin-top:16px;text-align:right"><a class="btn primary" href="#/trade">등급으로 매매안 만들기 →</a></div>`;
+    <div style="margin-top:16px;text-align:right"><a class="btn primary" href="#/trade">등급으로 매매안 만들기</a></div>`;
   const run = guard(async (tickers, force) => {
     const res = await api('/research', { method: 'POST', body: { tickers, force } });
     const msgs = [];
@@ -426,7 +440,7 @@ async function pageResearch() {
   view.querySelectorAll('[data-cancel]').forEach((b) => b.onclick = guard(async () => { await api(`/research/${b.dataset.cancel}/cancel`, { method: 'POST' }); pageResearch(); }));
   view.querySelectorAll('[data-del]').forEach((b) => b.onclick = guard(async () => { await api(`/research/${b.dataset.del}`, { method: 'DELETE' }); pageResearch(); }));
   view.querySelectorAll('[data-redo]').forEach((b) => b.onclick = () => { if (confirm(`${b.dataset.redo} 리서치를 새로 실행할까요? (API 비용 발생)`)) run([b.dataset.redo], true); });
-  view.querySelectorAll('tr.click').forEach((tr) => tr.onclick = (e) => { if (!e.target.closest('button')) location.hash = `#/research/${tr.dataset.id}`; });
+  view.querySelectorAll('tr.click').forEach((tr) => tr.onclick = (e) => { if (!e.target.closest('button,a')) location.hash = `#/research/${tr.dataset.id}`; });
   // Poll while something is queued or running, but never wipe a ticker the user is typing.
   if (active) state.timer = setTimeout(function tick() { if ($('#tickers')?.value) state.timer = setTimeout(tick, 4000); else pageResearch(); }, 4000);
 }
@@ -472,9 +486,9 @@ async function pageTrade() {
     <div class="two" style="grid-template-columns:1.25fr 1fr;margin-bottom:12px">
       <div class="card"><div class="pad" style="display:flex;align-items:center;gap:12px"><h2>매매안</h2><span class="faint small">지정가 · 당일 유효 · 1주 단위</span></div>
         <div class="table-wrap"><table><thead><tr><th></th><th>종목</th><th>등급</th><th>주문</th><th class="r">수량</th><th class="r">지정가</th><th class="r">금액</th><th>근거</th></tr></thead><tbody>
-        ${p.orders.map((o, i) => `<tr><td><input type="checkbox" data-o="${i}" checked></td><td class="tk">${esc(o.symbol)}</td>
+        ${p.orders.map((o, i) => `<tr><td><input type="checkbox" data-o="${i}" aria-label="${esc(o.symbol)} 주문 포함" checked></td><td class="tk">${esc(o.symbol)}</td>
           <td><a class="tag ${o.rating}" href="#/research/${o.researchId}">${RATING[o.rating]}</a></td><td><span class="${o.side === 'BUY' ? 'pos' : 'neg'}"><b>${o.side === 'BUY' ? '매수' : '매도'}</b></span></td>
-          <td class="r"><input type="number" min="1" max="${o.maxQuantity}" step="1" value="${o.quantity}" data-q="${i}" style="width:70px;text-align:right"></td>
+          <td class="r"><input type="number" min="1" max="${o.maxQuantity}" step="1" value="${o.quantity}" data-q="${i}" aria-label="${esc(o.symbol)} 수량" inputmode="numeric" style="width:70px;text-align:right"></td>
           <td class="r">${fmtMoney(o.price)}<div class="faint small">현재 ${fmtMoney(o.lastPrice)}</div></td><td class="r" data-amt="${i}">${fmtMoney(o.amount)}</td><td class="small muted">${esc(o.reason)}</td></tr>`).join('')
           || '<tr><td colspan="8" class="empty">실행할 주문이 없습니다. 리서치가 끝난 종목의 등급에 따라 여기에 주문이 만들어집니다.</td></tr>'}
         </tbody></table></div>
@@ -517,7 +531,7 @@ async function pageTrade() {
       confirmText = await new Promise((resolve) => {
         const box = modal(`<h2>실계좌 주문 전송</h2><p>토스증권 실계좌로 아래 ${orders.length}건의 지정가 주문을 전송합니다. 되돌릴 수 없습니다.</p>
           <div class="note">${orders.map((o) => `${esc(o.symbol)} ${o.side === 'BUY' ? '매수' : '매도'} ${o.quantity}주`).join(' · ')}</div>
-          <label class="small muted">계속하려면 <b>${esc(p.confirmPhrase)}</b> 를 입력하세요<br><input type="text" id="phrase" style="width:100%;margin-top:6px" autocomplete="off"></label>
+          <label class="small muted">계속하려면 <b>${esc(p.confirmPhrase)}</b> 를 입력하세요<br><input type="text" id="phrase" name="confirm-phrase" style="width:100%;margin-top:6px" autocomplete="off" spellcheck="false" autofocus></label>
           <div style="display:flex;gap:8px;justify-content:flex-end"><button class="btn" id="no">취소</button><button class="btn danger" id="yes" disabled>전송</button></div>`);
         $('#phrase', box).oninput = (e) => ($('#yes', box).disabled = e.target.value.trim() !== p.confirmPhrase);
         $('#no', box).onclick = () => { closeModal(); resolve(null); };

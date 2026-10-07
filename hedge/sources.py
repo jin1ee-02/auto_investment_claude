@@ -23,7 +23,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from . import config, db
+from . import config, db, funds_seed
 
 EDGAR_COOLDOWN_SECONDS = 6 * 3600
 APP_UA = 'hedge-insight-claude/1.0 (personal research tool)'
@@ -41,12 +41,13 @@ class SourceBlocked(SourceError):
 class Filing:
     cik: str
     period: str          # report date, YYYY-MM-DD (quarter end)
-    accession: str       # 18 digits, no dashes
+    accession: str       # 18 digits, no dashes ('+'-joined in storage when several filings were merged)
     form: str
     filed_at: str
     source: str
     url: str
     count: int | None = None
+    partial: bool = False    # a "new holdings" amendment: rows to add to the period's table, not a table
 
 
 class _Throttle:
@@ -78,9 +79,8 @@ def quarter_end(date_text):
 
 
 def previous_period(period):
-    d = dt.date.fromisoformat(period)
-    first = dt.date(d.year, d.month, 1) - dt.timedelta(days=62)
-    return quarter_end(first.isoformat())
+    d = dt.date.fromisoformat(quarter_end(period))
+    return (dt.date(d.year, d.month - 2, 1) - dt.timedelta(days=1)).isoformat()
 
 
 def period_label(period):
@@ -91,13 +91,15 @@ def period_label(period):
 def pick_filings(filings, quarters):
     """One filing per period: the latest-filed one that looks like a full table.
 
-    Amendments are either full restatements or small "new holdings" additions. A
-    restatement has roughly the original's row count, so anything under half of the
-    period's largest filing is treated as a partial addition and skipped.
+    Amendments are either full restatements or small "new holdings" additions. Where the
+    source does not say which (EDGAR's filing list), a restatement has roughly the
+    original's row count, so anything under half of the period's largest filing is
+    treated as a partial addition and skipped. A period with only additions is skipped.
     """
     by_period = {}
     for f in filings:
-        by_period.setdefault(f.period, []).append(f)
+        if not f.partial:
+            by_period.setdefault(f.period, []).append(f)
     chosen = []
     for period in sorted(by_period, reverse=True)[:quarters]:
         group = by_period[period]
@@ -105,6 +107,12 @@ def pick_filings(filings, quarters):
         full = [f for f in group if f.count is None or f.count >= largest * 0.5]
         chosen.append(max(full or group, key=lambda f: (f.filed_at, f.accession)))
     return chosen
+
+
+def additions(filings, base):
+    """Marked "new holdings" amendments that add rows to `base` (filed with or after it)."""
+    return sorted((f for f in filings if f.partial and f.period == base.period and f.filed_at >= base.filed_at),
+                  key=lambda f: (f.filed_at, f.accession))
 
 
 def aggregate(rows):
@@ -140,8 +148,13 @@ class ThirteenFInfo:
             raise SourceError(f'13f.info HTTP {r.status_code}')
         return r
 
+    # Form column: the original is "13F-HR"; amendments are labelled by what they do.
+    FORMS = {'RESTATEMENT': ('13F-HR/A', False), 'NEW HOLDINGS': ('13F-HR/A', True)}
+
     def list_filings(self, cik):
-        html = self._get(f'/manager/{int(cik):010d}').text
+        return self.parse_manager(cik, self._get(f'/manager/{int(cik):010d}').text)
+
+    def parse_manager(self, cik, html):
         name = re.search(r'<h1[^>]*>\s*(.*?)\s*</h1>', html, re.S)
         table = html.split('id="managerFilings"', 1)
         if len(table) < 2:
@@ -149,16 +162,18 @@ class ThirteenFInfo:
         filings = []
         for block in table[1].split('<tr')[2:]:
             head = re.search(r'data-order="(\d{4}-\d{2}-\d{2})">\s*<a href="(/13f/(\d{18})[^"]*)"', block)
-            form = re.search(r'title="(13F-[^"]+)"', block)
+            form = re.search(r'text-center truncate" title="([^"]+)"', block)
             filed = re.findall(r'data-order="(\d{4}-\d{2}-\d{2})"', block)
             count = re.search(r'text-right">\s*([\d,]+)\s*</td>', block)
             if not head or not form or len(filed) < 2:
                 continue
-            if not form.group(1).startswith('13F-HR'):
+            label = form.group(1).strip().upper()
+            if not label.startswith('13F-HR') and label not in self.FORMS:
                 continue
-            filings.append(Filing(str(int(cik)), quarter_end(head.group(1)), head.group(3), form.group(1),
+            form, partial = self.FORMS.get(label, (label, False))
+            filings.append(Filing(str(int(cik)), quarter_end(head.group(1)), head.group(3), form,
                                   filed[-1], self.name, self.base + head.group(2),
-                                  int(count.group(1).replace(',', '')) if count else None))
+                                  int(count.group(1).replace(',', '')) if count else None, partial))
         return (re.sub(r'\s+', ' ', name.group(1)) if name else ''), filings
 
     def holdings(self, filing):
@@ -373,13 +388,20 @@ def refresh_fund(cik, quarters=3, force=False):
             chosen = pick_filings(filings, quarters)
             if not chosen:
                 raise SourceError('13F-HR 공시가 없습니다')
+            former = [f for old in funds_seed.PREDECESSORS.get(cik, ())
+                      for f in pick_filings(provider.list_filings(old)[1], 99)]
             stored = []
             for filing in chosen:
+                # One period's table = the chosen filing + later "new holdings" amendments
+                # + what a predecessor filer reported for the same period.
+                parts = [filing] + additions(filings, filing) + [f for f in former if f.period == filing.period]
+                merged = '+'.join(p.accession for p in parts)
                 existing = db.one('SELECT accession FROM filings WHERE cik=? AND period=?', (cik, filing.period))
-                if existing and existing['accession'] == filing.accession and not force:
+                if existing and existing['accession'] == merged and not force:
                     stored.append(filing.period)
                     continue
-                rows = finalize(provider.holdings(filing))
+                rows = finalize([r for p in parts for r in provider.holdings(p)])
+                filing.accession = merged
                 store_filing(filing, rows)
                 stored.append(filing.period)
             with db.tx() as c:
