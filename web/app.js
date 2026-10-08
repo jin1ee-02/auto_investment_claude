@@ -127,6 +127,52 @@ async function route() {
 }
 window.addEventListener('hashchange', route);
 
+// ───────────── sleeve record ─────────────
+// Every page's sleeve (.head) gets the record that is playing, slid halfway out. Pages re-render often,
+// so the angle comes from one clock rather than from the element: a fresh record picks up where the last one was.
+const RPM_MS = 1800; // 33⅓ rpm
+const spin = { ms: 0, since: null, anim: null };
+const stillMotion = matchMedia('(prefers-reduced-motion: reduce)');
+let unsleeved = false;
+function dressHead() {
+  const head = view.querySelector(':scope > .head');
+  if (!head) return;
+  const deck = document.createElement('div');
+  deck.className = unsleeved ? 'deck' : 'deck enter'; unsleeved = true;
+  head.before(deck); deck.append(head);
+  head.classList.toggle('long', (head.querySelector('h1')?.firstChild?.textContent || '').trim().length > 8);
+  deck.insertAdjacentHTML('beforeend', `<button class="record" type="button"><span class="disc"><svg viewBox="0 0 100 100" aria-hidden="true">
+    <circle cx="50" cy="50" r="50" fill="${css('--mark')}"/><circle cx="50" cy="50" r="46.5" fill="none" stroke="${css('--mark-ink')}" stroke-width=".6"/>
+    <path id="arc-top" d="M14 50a36 36 0 0 1 72 0" fill="none"/><path id="arc-bottom" d="M9 50a41 41 0 0 0 82 0" fill="none"/>
+    <text text-anchor="middle"><textPath id="rec-title" href="#arc-top" startOffset="50%"></textPath></text>
+    <text text-anchor="middle"><textPath id="rec-artist" href="#arc-bottom" startOffset="50%"></textPath></text>
+    <circle cx="50" cy="50" r="4.2" fill="${css('--bg')}"/></svg></span></button>`);
+  $('.record', deck).onclick = () => window.music?.toggle();
+  if (!stillMotion.matches) {
+    spin.anim = $('.disc', deck).animate({ transform: ['rotate(0turn)', 'rotate(1turn)'] }, { duration: RPM_MS, iterations: Infinity });
+    spin.anim.pause();
+  }
+  syncRecord();
+}
+function syncRecord() {
+  const m = window.music?.state() || { off: true }, now = performance.now();
+  if (m.playing && spin.since == null) spin.since = now;
+  if (!m.playing && spin.since != null) { spin.ms += now - spin.since; spin.since = null; }
+  const rec = $('.record');
+  if (!rec) return;
+  rec.disabled = !!m.off;
+  rec.setAttribute('aria-label', m.off ? '레코드' : m.playing ? `${m.title} 일시정지` : `${m.title} 재생`);
+  rec.title = m.off ? '' : m.playing ? '일시정지' : '재생';
+  $('#rec-title').textContent = m.off ? 'Hedge Insight' : m.title;
+  $('#rec-artist').textContent = m.off ? '13F' : m.artist;
+  if (spin.anim?.effect?.target?.isConnected) {
+    spin.anim.currentTime = (spin.ms + (spin.since == null ? 0 : now - spin.since)) % RPM_MS;
+    m.playing ? spin.anim.play() : spin.anim.pause();
+  }
+}
+new MutationObserver(dressHead).observe(view, { childList: true });
+document.addEventListener('music', syncRecord);
+
 async function saveSelection() {
   const r = await api('/selection', { method: 'PUT', body: { ciks: state.selection } });
   state.selection = r.selection;
@@ -160,6 +206,11 @@ async function pageFunds() {
         <button class="btn" id="add">+ 기관 추가</button>
         <a class="btn primary" href="#/consensus">선택한 ${state.selection.length}개 펀드의 공통 매매 보기</a>
       </div>
+      <dl class="figures">
+        <div><dt>추적 중인 기관</dt><dd>${data.funds.length}</dd></div>
+        <div><dt>13F 평가액 합계</dt><dd>${fmtUsd(data.funds.reduce((s, f) => s + (f.totalValue || 0), 0))}</dd></div>
+        <div><dt>공통 매매 분석에 포함</dt><dd id="seln">${state.selection.length}</dd></div>
+      </dl>
     </div>
     <div class="card ledger">
       <div class="ledger-head"><span></span><span>운용사</span><span class="n">13F 평가액</span><span class="n">종목 수</span><span class="n">추정 수익률</span><span class="wide">상위 5개 비중</span><span class="wide n">이번 분기 매매</span></div>
@@ -175,6 +226,7 @@ async function pageFunds() {
     box.closest('.fund').classList.toggle('sel', box.checked);
     await saveSelection();
     $('.head .btn.primary').textContent = `선택한 ${state.selection.length}개 펀드의 공통 매매 보기`;
+    $('#seln').textContent = state.selection.length;
   }));
 }
 function fundCard(f) {
