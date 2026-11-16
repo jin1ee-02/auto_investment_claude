@@ -188,6 +188,26 @@ class AnalysisTest(Base):
         self.assertAlmostEqual(h['BBB']['quarterPricePct'], 25.0)
         self.assertEqual(len(h['BBB']['weights']), 4)
 
+    def test_cost_basis(self):
+        self.assertAlmostEqual(analysis.cost_basis([(100, 10), (200, 20)]), 15.0)     # bought 100 @10, 100 @20
+        self.assertAlmostEqual(analysis.cost_basis([(100, 10), (50, 30)]), 10.0)      # a trim keeps the average
+        self.assertAlmostEqual(analysis.cost_basis([(100, 10), (0, 30), (10, 40)]), 40.0)   # exit starts over
+        self.assertIsNone(analysis.cost_basis([(100, None)]))
+        self.assertIsNone(analysis.cost_basis([(100, 10), (0, 12)]))
+
+    def test_position_track_marks_trades_and_breakeven(self):
+        q4 = '2025-12-31'
+        put('1', q4, [('AAA', 100, 1000)])
+        put('1', Q1, [('AAA', 300, 6000)])                                # price 10 -> 20, bought 200
+        put('1', Q2, [('AAA', 150, 3750)])                                # price 25, trimmed half
+        t = analysis.position_track('1', 'AAA', Q2)
+        self.assertEqual([r['action'] for r in t['rows']], ['hold', 'add', 'reduce'])
+        self.assertEqual([r['price'] for r in t['rows']], [10, 20, 25])
+        self.assertAlmostEqual(t['breakeven'], (100 * 10 + 200 * 20) / 300)
+        h = analysis.position_history('1', Q2)['positions']['AAA']
+        self.assertAlmostEqual(h['breakeven'], t['breakeven'])
+        self.assertAlmostEqual(h['plPct'], (25 / t['breakeven'] - 1) * 100)
+
 
 class TradingTest(Base):
     def setUp(self):

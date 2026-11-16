@@ -221,19 +221,64 @@ def fund_history(cik):
             'benchAnnualPct': (bench_cum ** (1 / years) - 1) * 100 if n >= 4 else None}
 
 
+def price_path(key, upto, quarters=None):
+    """Implied quarter-end price of `key` for each stored period up to `upto`, on `upto`'s share basis.
+
+    Earlier prices are divided by every split detected after them, so a 2:1 split does not
+    look like a halving. Returns ({period: price or None}, {period: split factor to upto}).
+    """
+    quarters = quarters or [q for q in reversed(periods()) if q <= upto]
+    raw, split = {}, {}
+    for q in quarters:
+        prices, splits = market(previous_period(q), q)
+        raw[q] = prices.get(key, (None, None))[1]
+        split[q] = splits.get(key, 1)
+    adj, factor = {}, 1.0
+    for q in reversed(quarters):
+        adj[q] = factor
+        factor *= split[q]
+    return {q: raw[q] / adj[q] if raw[q] else None for q in quarters}, adj
+
+
+def cost_basis(steps):
+    """Average cost per share of the open position, buying at each quarter-end price.
+
+    steps: [(shares, price)] oldest first, shares and prices on one split basis. Adds are bought
+    at that quarter's price, trims keep the average, and a full exit starts over. None when an
+    add has no price.
+    """
+    cost = held = 0.0
+    unknown = False
+    for shares, price in steps:
+        if shares > held:
+            if price is None:
+                unknown = True
+            else:
+                cost += (shares - held) * price
+        elif shares < held:
+            cost *= shares / held
+        if shares <= 0:
+            cost, unknown = 0.0, False
+        held = shares
+    return None if unknown or held <= 0 else cost / held
+
+
 def position_history(cik, period):
     """For each share position held at `period`: how long it has been held and how its price moved.
 
     heldQuarters counts consecutive quarters back from `period`; `heldSinceStart` means the
     streak reaches the oldest stored filing, so the real holding period may be longer.
     sincePct is the split-adjusted price change since the first quarter of that streak.
+    breakeven is the estimated average cost (quarter-end prices) and plPct the gain on it at `period`.
     """
-    periods = [r['period'] for r in db.rows('SELECT period, total_value FROM filings WHERE cik=? AND period<=? ORDER BY period',
-                                            (cik, period))]
+    fund_periods = [r['period'] for r in db.rows('SELECT period FROM filings WHERE cik=? AND period<=? ORDER BY period',
+                                                 (cik, period))]
+    quarters = [q for q in reversed(periods()) if q <= period]
     totals = {r['period']: r['total_value'] or 1 for r in db.rows('SELECT period, total_value FROM filings WHERE cik=?', (cik,))}
-    weights = {}
-    for r in db.rows("SELECT period, key, value FROM holdings WHERE cik=? AND kind='' AND period<=?", (cik, period)):
+    weights, shares = {}, {}
+    for r in db.rows("SELECT period, key, value, shares FROM holdings WHERE cik=? AND kind='' AND period<=?", (cik, period)):
         weights.setdefault(r['key'], {})[r['period']] = r['value'] / totals[r['period']] * 100
+        shares.setdefault(r['key'], {})[r['period']] = r['shares']
     out = {}
     for key, w in weights.items():
         if period not in w:
@@ -251,11 +296,58 @@ def position_history(cik, period):
                 break
             ratio *= step
         quarter = price_step(key, period)
-        out[key] = {'heldQuarters': len(streak), 'firstPeriod': first, 'heldSinceStart': first == periods[0],
+        price, adj = price_path(key, period, quarters)
+        cost = cost_basis([(shares[key].get(q, 0) * adj.get(q, 1), price.get(q)) for q in fund_periods])
+        now = price.get(period)
+        out[key] = {'heldQuarters': len(streak), 'firstPeriod': first, 'heldSinceStart': first == fund_periods[0],
                     'sincePct': (ratio - 1) * 100 if ratio is not None and len(streak) > 1 else None,
                     'quarterPricePct': (quarter - 1) * 100 if quarter else None,
-                    'weights': [round(w.get(q, 0), 3) for q in periods]}
-    return {'periods': periods, 'positions': out}
+                    'price': now, 'breakeven': cost,
+                    'plPct': (now / cost - 1) * 100 if cost and now else None,
+                    'weights': [round(w.get(q, 0), 3) for q in fund_periods]}
+    return {'periods': fund_periods, 'positions': out}
+
+
+def position_track(cik, key, period):
+    """One position over every stored quarter: price, the fund's shares, and what it did each quarter."""
+    quarters = [q for q in reversed(periods()) if q <= period]
+    price, adj = price_path(key, period, quarters)
+    filed = {r['period'] for r in db.rows('SELECT period FROM filings WHERE cik=?', (cik,))}
+    held = {r['period']: r['shares'] for r in db.rows("SELECT period, shares FROM holdings WHERE cik=? AND key=? AND kind=''",
+                                                      (cik, key))}
+    rows, steps, prev = [], [], None
+    for q in quarters:
+        sh = held.get(q, 0) * adj[q] if q in filed else None
+        action = None
+        if sh is not None and prev is not None:
+            if prev == 0 and sh > 0:
+                action = 'new'
+            elif prev > 0 and sh == 0:
+                action = 'exit'
+            elif prev > 0 and abs(sh / prev - 1) >= 0.01:
+                action = 'add' if sh > prev else 'reduce'
+            elif sh > 0:
+                action = 'hold'
+        elif sh:
+            action = 'hold'
+        if sh is not None:
+            steps.append((sh, price[q]))
+            prev = sh
+        rows.append({'period': q, 'label': period_label(q), 'price': price[q], 'shares': sh,
+                     'value': sh * price[q] if sh and price[q] else None, 'action': action, 'filed': q in filed})
+    return {'key': key, 'rows': rows, 'breakeven': cost_basis(steps)}
+
+
+def track_record(cik, period):
+    """Chained estimated return of `cik` up to `period`, for the fund list."""
+    linked = [q for q in fund_history(cik)['quarters'] if q['period'] <= period and q['returnPct'] is not None
+              and q['benchPct'] is not None]
+    if not linked:
+        return None
+    n, last = len(linked), linked[-1]
+    return {'quarters': n, 'cumPct': last['cumPct'], 'benchCumPct': last['benchCumPct'],
+            'annualPct': ((1 + last['cumPct'] / 100) ** (4 / n) - 1) * 100 if n >= 4 else None,
+            'from': period_label(previous_period(linked[0]['period']))}
 
 
 def fund_summary(fund, period):
@@ -282,6 +374,8 @@ def fund_summary(fund, period):
         'prevTotalValue': diff['prevFiling']['total_value'] if diff['prevFiling'] else None,
         'top': [{'label': p['ticker'] or p['name'], 'weight': p['weight']} for p in longs[:5]],
         'top10Weight': sum(p['weight'] for p in longs[:10]),
+        'top20Weight': sum(p['weight'] for p in longs[:20]),
+        'track': track_record(cik, period),
         'counts': counts, 'turnover': turnover, 'copyReturn': copy_return(cik, period),
     })
     return out

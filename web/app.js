@@ -191,6 +191,7 @@ async function pageFunds() {
     featured: () => 0,
     aum: (a, b) => (b.totalValue || 0) - (a.totalValue || 0),
     ret: (a, b) => (b.copyReturn?.returnPct ?? -1e9) - (a.copyReturn?.returnPct ?? -1e9),
+    cum: (a, b) => (b.track?.cumPct ?? -1e9) - (a.track?.cumPct ?? -1e9),
     turnover: (a, b) => (b.turnover ?? -1) - (a.turnover ?? -1),
     conc: (a, b) => (b.top10Weight ?? -1) - (a.top10Weight ?? -1),
   };
@@ -201,7 +202,7 @@ async function pageFunds() {
       <div class="right">
         <select id="sort" aria-label="정렬 기준">
           <option value="featured">기본 순서</option><option value="aum">운용 규모순</option>
-          <option value="ret">추정 분기 수익률순</option><option value="turnover">회전율순</option><option value="conc">집중도순</option>
+          <option value="ret">추정 분기 수익률순</option><option value="cum">누적 추정 수익률순</option><option value="turnover">회전율순</option><option value="conc">집중도순</option>
         </select>
         <button class="btn" id="add">+ 기관 추가</button>
         <a class="btn primary" href="#/consensus">선택한 ${state.selection.length}개 펀드의 공통 매매 보기</a>
@@ -215,7 +216,7 @@ async function pageFunds() {
     </div>
     ${data.recent.length ? `<div class="card recent"><h3>최근 13F 공시</h3>${data.recent.map((r) => `<a class="chip" href="#/fund/${r.cik}"><b>${esc(r.name)}</b> ${esc(r.label)} · ${esc(r.filedAt)}</a>`).join('')}</div>` : ''}
     <div class="card ledger">
-      <div class="ledger-head"><span></span><span>운용사</span><span class="n">13F 평가액</span><span class="n">종목 수</span><span class="n">추정 수익률</span><span class="wide">상위 5개 비중</span><span class="wide n">이번 분기 매매</span></div>
+      <div class="ledger-head"><span></span><span>운용사</span><span class="n">13F 평가액</span><span class="n">종목 수</span><span class="n">분기 · 누적 수익률</span><span class="wide">상위 5개 비중</span><span class="wide n">이번 분기 매매</span></div>
       ${funds.map(fundCard).join('')}</div>
     <p class="note" style="margin-top:16px">추정 분기 수익률은 <b>직전 분기 말 주식 보유분을 그대로 들고 있었을 때</b>의 수익률입니다(13F 평가액÷주식 수로 역산한 분기 말 가격 기준).
     분기 중 매매·공매도·옵션·현금은 반영되지 않으므로 펀드의 실제 성과가 아닙니다. 목록은 편집된 유명 펀드 목록이며 순위가 아닙니다.</p>`;
@@ -247,13 +248,20 @@ function fundCard(f) {
       <div class="fund-meta">${esc([f.manager, f.style].filter(Boolean).join(' · '))}</div>${latestLine(f)}</div>
     <div class="n"><span class="lbl">13F 평가액</span>${fmtUsd(f.totalValue)}</div>
     <div class="n"><span class="lbl">종목 수</span>${fmtNum(f.positions)}</div>
-    <div class="n"><span class="lbl">추정 수익률</span>${f.copyReturn ? signed(f.copyReturn.returnPct) : '–'}</div>
+    <div class="n"><span class="lbl">분기 · 누적 수익률</span>${f.copyReturn ? signed(f.copyReturn.returnPct) : '–'}${trackLine(f.track)}</div>
     <div class="alloc"><div class="minibar">${bar}</div>
       <div class="minilegend">${f.top.map((t, i) => `<span><i style="background:var(${SERIES[i]})"></i>${esc(t.label)} ${t.weight.toFixed(0)}%</span>`).join('')}</div></div>
     <div class="acts">${f.turnover == null ? '<span class="faint">직전 분기 공시 없음</span>' : `
       <span class="tag new">신규 ${c.new}</span><span class="tag add">확대 ${c.add}</span><span class="tag reduce">축소 ${c.reduce}</span><span class="tag exit">청산 ${c.exit}</span>
       <span class="tag" title="비중 변화 절댓값 합의 절반">회전 ${f.turnover.toFixed(0)}%</span>`}</div>
   </div>`;
+}
+// Chained estimate under the quarter's figure: "누적 +20% · 7Q", with the S&P 500 in the tooltip.
+function trackLine(t) {
+  if (!t) return '';
+  const pct = (v) => `${v > 0 ? '+' : ''}${v.toFixed(1)}%`;
+  const tipText = `${t.from} 이후 ${t.quarters}분기 연결 누적 ${pct(t.cumPct)}${t.annualPct != null ? ` (연 ${pct(t.annualPct)})` : ''} · 같은 기간 S&P 500 ${pct(t.benchCumPct)}`;
+  return `<div class="cum" title="${esc(tipText)}">누적 ${signed(t.cumPct, 0)} · ${t.quarters}Q</div>`;
 }
 // Which quarter each fund has filed up to, so a fresh 13F shows up before the period selector moves.
 function latestLine(f) {
@@ -537,37 +545,118 @@ const FUND_VIEWS = {
   },
 
   all(body, d) {
-    body.innerHTML = `<div class="card"><div class="pad" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><h2>보유 · 매매 내역</h2><div class="tabs" id="ftabs"></div>
-      <span class="faint small" style="margin-left:auto">${d.totalPositions > d.positions.length ? `평가액 상위 ${d.positions.length}개 표시 (전체 ${fmtNum(d.totalPositions)}개)` : ''}</span></div>
-      <div class="table-wrap" style="max-height:680px"><table id="ftable"></table></div></div>`;
-    const filters = { all: ['전체', () => true], new: ['신규', (p) => p.action === 'new'], add: ['확대', (p) => p.action === 'add'], reduce: ['축소', (p) => p.action === 'reduce'], exit: ['청산', (p) => p.action === 'exit'], opt: ['옵션', (p) => p.kind === 'PUT' || p.kind === 'CALL'] };
+    body.innerHTML = `<div class="card"><div class="pad toolbar"><h2>보유 · 매매 내역</h2><div class="tabs" id="ftabs"></div>
+      <input type="search" id="fq" name="holding-search" aria-label="티커 또는 종목명 검색" placeholder="티커·종목명 검색" autocomplete="off" spellcheck="false">
+      <button type="button" class="btn sm" id="fcsv" title="지금 보이는 행을 CSV 로 저장">CSV 내보내기</button>
+      <span class="faint small" id="fcount"></span></div>
+      <div class="table-wrap" style="max-height:720px"><table id="ftable"></table></div></div>
+      <p class="note" style="margin-top:16px">행을 누르면 분기 말 가격과 이 펀드의 보유 주식 수, 매수·매도 시점을 볼 수 있습니다.
+      <b>추정 매입가</b>는 주식 수가 늘어난 분기마다 그 분기 말 가격에 샀다고 보고 계산한 평균 단가이고(분할 보정), <b>손익</b>은 ${esc(d.periodLabel)} 분기 말 가격 기준입니다.
+      수집된 첫 분기부터 보유한 종목(보유 기간에 +)은 그 분기 가격을 매입가로 씁니다. <b>하락 중 추가</b>는 이번 분기 주가가 5% 넘게 내렸는데 주식 수를 늘린 종목입니다.</p>`;
+    const filters = {
+      all: ['전체', () => true], new: ['신규', (p) => p.action === 'new'], add: ['확대', (p) => p.action === 'add'], reduce: ['축소', (p) => p.action === 'reduce'],
+      exit: ['청산', (p) => p.action === 'exit'], dd: ['하락 중 추가', doubledDown], opt: ['옵션', (p) => p.kind === 'PUT' || p.kind === 'CALL'],
+    };
     const keep = (k, p) => filters[k][1](p) && (k === 'opt' || k === 'all' || p.kind === '');
     const maxW = Math.max(...d.positions.map((p) => p.weight), 1);
     const span = d.histPeriods.length > 1 ? `${d.histPeriods[0]}→${d.histPeriods.at(-1)}` : '';
-    const render = () => {
-      $('#ftabs').innerHTML = Object.entries(filters).map(([k, [label]]) => `<button type="button" data-k="${k}" class="${k === fundFilter ? 'on' : ''}">${label}<span>${d.positions.filter((p) => keep(k, p)).length}</span></button>`).join('');
-      $('#ftabs').querySelectorAll('button').forEach((b) => b.onclick = () => { fundFilter = b.dataset.k; render(); });
-      const rows = d.positions.filter((p) => keep(fundFilter, p));
-      if (fundFilter !== 'all' && fundFilter !== 'opt') rows.sort((a, b) => Math.abs(b.tradeValue) - Math.abs(a.tradeValue));
+    let shown = [];
+    const renderRows = () => {
+      const q = $('#fq').value.trim().toLowerCase();
+      shown = d.positions.filter((p) => keep(fundFilter, p) && (!q || (p.ticker || '').toLowerCase().includes(q) || (p.name || '').toLowerCase().includes(q) || (p.cusip || '').toLowerCase().includes(q)));
+      if (fundFilter !== 'all' && fundFilter !== 'opt') shown.sort((a, b) => Math.abs(b.tradeValue) - Math.abs(a.tradeValue));
+      $('#fcount').textContent = `${fmtNum(shown.length)}행${d.totalPositions > d.positions.length ? ` · 평가액 상위 ${d.positions.length}개 중 (전체 ${fmtNum(d.totalPositions)}개)` : ''}`;
       $('#ftable').innerHTML = `<thead><tr><th>종목</th><th></th><th class="r">비중</th><th class="r">평가액</th><th class="r">주식 수</th><th>변화</th><th class="r">주식 수 변화</th><th class="r">비중 변화</th><th class="r">추정 매매액</th>
-        <th class="r">분기 주가</th><th class="r" title="연속 보유 분기 수. +는 수집된 첫 분기부터 보유">보유</th><th title="${esc(span)}">비중 추이</th><th>리서치</th></tr></thead>
-        <tbody>${rows.map((p) => `<tr>
+        <th class="r">분기 주가</th><th class="r" title="주식 수가 늘어난 분기마다 분기 말 가격에 샀다고 본 평균 단가">추정 매입가</th><th class="r" title="${esc(d.periodLabel)} 분기 말 가격 기준">손익</th>
+        <th class="r" title="연속 보유 분기 수. +는 수집된 첫 분기부터 보유">보유</th><th title="${esc(span)}">비중 추이</th><th>리서치</th></tr></thead>
+        <tbody>${shown.map((p, i) => `<tr class="${p.kind === '' ? 'click' : ''}" data-i="${i}" ${p.kind === '' ? 'aria-expanded="false" title="가격·매매 이력 펼치기"' : ''}>
           <td><span class="tk">${esc(p.ticker || p.cusip)}</span>${p.kind ? ` <span class="tag">${p.kind}</span>` : ''}${p.split ? ` <span class="tag" title="주식 분할을 감지해 직전 주식 수를 보정했습니다">분할 ×${+p.split.toFixed(2)}</span>` : ''}</td>
           <td><div class="nm" title="${esc(p.name)}">${esc(p.name)}</div></td>
           <td class="r"><span class="wbar" style="width:${p.weight / maxW * 60}px"></span>${fmtPct(p.weight, 2)}</td>
           <td class="r">${fmtUsd(p.value)}</td><td class="r">${fmtNum(p.shares)}</td>
-          <td><span class="tag ${p.action}">${ACTION[p.action]}</span></td>
+          <td><span class="tag ${p.action}">${ACTION[p.action]}</span>${doubledDown(p) ? ' <span class="tag dd" title="이번 분기 주가 하락에도 주식 수를 늘림">하락 중 추가</span>' : ''}</td>
           <td class="r">${p.action === 'new' ? '<span class="pos">신규</span>' : signed(p.changePct)}</td>
           <td class="r">${signed(p.weightDelta, 2, '%p')}</td>
           <td class="r">${usdSigned(p.tradeValue || null)}</td>
           <td class="r">${signed(p.hist?.quarterPricePct)}</td>
+          <td class="r">${p.hist?.breakeven ? fmtMoney(p.hist.breakeven) : '–'}</td>
+          <td class="r">${signed(p.hist?.plPct)}</td>
           <td class="r small">${p.hist?.heldQuarters ? `${p.hist.heldQuarters}${p.hist.heldSinceStart ? '+' : ''}분기` : '–'}</td>
           <td>${spark(p.hist?.weights)}</td>
-          <td>${ratingTag(p.research)}</td></tr>`).join('') || `<tr><td colspan="13" class="empty">해당 내역이 없습니다</td></tr>`}</tbody>`;
+          <td>${ratingTag(p.research)}</td></tr>`).join('') || `<tr><td colspan="15" class="empty">해당 내역이 없습니다</td></tr>`}</tbody>`;
+      $('#ftable').querySelectorAll('tr.click').forEach((tr) => tr.onclick = (e) => { if (!e.target.closest('a,button,input')) openTrack(tr, shown[+tr.dataset.i], d); });
+      rowKeys($('#ftable'));
     };
+    const render = () => {
+      $('#ftabs').innerHTML = Object.entries(filters).map(([k, [label]]) => `<button type="button" data-k="${k}" class="${k === fundFilter ? 'on' : ''}">${label}<span>${d.positions.filter((p) => keep(k, p)).length}</span></button>`).join('');
+      $('#ftabs').querySelectorAll('button').forEach((b) => b.onclick = () => { fundFilter = b.dataset.k; render(); });
+      renderRows();
+    };
+    let t;
+    $('#fq').oninput = () => { clearTimeout(t); t = setTimeout(renderRows, 150); };
+    $('#fcsv').onclick = () => downloadCsv(`${d.fund.name}-${d.periodLabel}${fundFilter === 'all' ? '' : '-' + filters[fundFilter][0]}.csv`,
+      ['ticker', 'name', 'cusip', 'kind', 'weight_pct', 'value_usd', 'shares', 'action', 'share_change_pct', 'weight_change_pp', 'est_trade_value_usd',
+        'quarter_price_change_pct', 'est_breakeven_usd', 'est_pl_pct', 'held_quarters', 'prev_weight_pct'],
+      shown.map((p) => [p.ticker, p.name, p.cusip, p.kind, r4(p.weight), Math.round(p.value), Math.round(p.shares), p.action, r4(p.changePct), r4(p.weightDelta),
+        Math.round(p.tradeValue), r4(p.hist?.quarterPricePct), r4(p.hist?.breakeven), r4(p.hist?.plPct), p.hist?.heldQuarters, r4(p.prevWeight)]));
     render();
   },
 };
+
+// "Double down": the quarter's price fell more than 5% and the fund still bought more shares.
+const doubledDown = (p) => p.kind === '' && p.action === 'add' && p.hist?.quarterPricePct != null && p.hist.quarterPricePct < -5;
+const r4 = (v) => v == null ? '' : +v.toFixed(4);
+
+function downloadCsv(name, header, rows) {
+  const cell = (v) => v == null ? '' : /[",\r\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v);
+  const text = '﻿' + [header, ...rows].map((r) => r.map(cell).join(',')).join('\r\n');   // BOM: Excel reads it as UTF-8
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'text/csv;charset=utf-8' }));
+  a.download = name.replace(/[\\/:*?"<>|]+/g, '_');
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+function dropChart(el) {
+  const c = el && echarts.getInstanceByDom(el);
+  if (c) { c.dispose(); state.charts = state.charts.filter((x) => x !== c); }
+}
+
+// One position's price path with the fund's buys and sells marked on it, opened under its row.
+const openTrack = guard(async (tr, p, d) => {
+  const next = tr.nextElementSibling;
+  if (next?.classList.contains('detail-row')) { dropChart(next.querySelector('.chart')); next.remove(); tr.setAttribute('aria-expanded', 'false'); return; }
+  tr.setAttribute('aria-expanded', 'true');
+  tr.insertAdjacentHTML('afterend', `<tr class="detail-row"><td colspan="15"><div class="track"><div class="chart"></div><dl class="track-side"><div><dt>불러오는 중…</dt></div></dl></div></td></tr>`);
+  const row = tr.nextElementSibling;
+  // The table scrolls sideways; keep the chart the width of what is visible and pinned to the left edge.
+  row.querySelector('.track').style.width = `${tr.closest('.table-wrap').clientWidth - 48}px`;
+  const t = await api(`/funds/${d.fund.cik}/track/${encodeURIComponent(p.key)}?period=${d.period}`);
+  if (!row.isConnected) return;
+  const rows = t.rows.filter((r) => r.price != null || r.shares);
+  const last = [...rows].reverse().find((r) => r.price != null);
+  const pl = t.breakeven && last ? (last.price / t.breakeven - 1) * 100 : null;
+  row.querySelector('.track-side').innerHTML = `
+    <div><dt>${esc(last?.label || d.periodLabel)} 분기 말 가격</dt><dd>${last ? fmtMoney(last.price) : '–'}</dd></div>
+    <div><dt>추정 매입가</dt><dd>${t.breakeven ? fmtMoney(t.breakeven) : '–'}</dd></div>
+    <div><dt>추정 손익</dt><dd>${signed(pl)}</dd></div>
+    <div><dt>보유</dt><dd>${p.hist?.heldQuarters ? `${p.hist.heldQuarters}${p.hist.heldSinceStart ? '+' : ''}분기` : p.action === 'exit' ? '이번 분기 청산' : '–'}</dd></div>`;
+  const MARK = { new: ['triangle', '--up', '신규'], add: ['triangle', '--up', '확대'], reduce: ['triangle', '--down', '축소'], exit: ['triangle', '--down', '청산'] };
+  const marks = rows.map((r, i) => r.action in MARK && r.price != null ? { coord: [i, r.price], action: r.action } : null).filter(Boolean);
+  chart(row.querySelector('.chart'), {
+    grid: { left: 64, right: 64, top: 28, bottom: 32 },
+    legend: { top: 0, right: 12, textStyle: { color: css('--text-2'), fontSize: 11 }, itemWidth: 12, itemHeight: 8, data: ['분기 말 가격', '보유 주식 수'] },
+    tooltip: tip({ trigger: 'axis', formatter: (ps) => { const r = rows[ps[0].dataIndex]; return `<b>${r.label}</b><br>가격 ${r.price != null ? fmtMoney(r.price) : '–'}<br>보유 ${r.shares == null ? '공시 없음' : fmtNum(r.shares) + '주'}${r.value ? ` · ${fmtUsd(r.value)}` : ''}${MARK[r.action] ? `<br>${MARK[r.action][2]}` : ''}`; } }),
+    xAxis: { type: 'category', data: rows.map((r) => r.label), ...axis({ splitLine: { show: false } }) },
+    yAxis: [{ type: 'value', scale: true, ...axis(), axisLabel: { color: css('--text-2'), fontSize: 11, formatter: (v) => '$' + fmtNum(v) } },
+      { type: 'value', ...axis({ splitLine: { show: false } }), axisLabel: { color: css('--text-3'), fontSize: 11, formatter: (v) => fmtUsd(v).replace('$', '') } }],
+    series: [
+      { name: '보유 주식 수', type: 'bar', yAxisIndex: 1, barMaxWidth: 28, data: rows.map((r) => r.shares), itemStyle: { color: css('--s-other'), borderRadius: [2, 2, 0, 0] } },
+      { name: '분기 말 가격', type: 'line', data: rows.map((r) => r.price), symbolSize: 5, lineStyle: { color: css('--text'), width: 2 }, itemStyle: { color: css('--text') },
+        markPoint: { data: marks.map((m) => ({ coord: m.coord, symbol: 'triangle', symbolSize: 12, symbolRotate: m.action === 'new' || m.action === 'add' ? 0 : 180, symbolOffset: [0, m.action === 'new' || m.action === 'add' ? 12 : -12], itemStyle: { color: css(MARK[m.action][1]) }, label: { show: false } })) },
+        markLine: t.breakeven ? { symbol: 'none', silent: true, lineStyle: { color: css('--mark'), type: 'dashed' }, label: { color: css('--mark'), formatter: `추정 매입가 ${fmtMoney(t.breakeven)}`, position: 'insideEndTop' }, data: [{ yAxis: t.breakeven }] } : undefined },
+    ],
+  });
+});
 
 function tradeTable(title, rows, cls) {
   return `<div class="card"><div class="pad"><h2><span class="${cls}">${cls === 'pos' ? '▲' : '▼'}</span> ${title} <span class="faint small">${rows.length}종목</span></h2></div>

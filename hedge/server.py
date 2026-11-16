@@ -232,6 +232,13 @@ def fund_detail(cik: str, period: str | None = None, limit: int = 600):
             'history': _history(cik, analysis._version), 'histPeriods': [sources.period_label(p) for p in held['periods']]}
 
 
+@app.get('/api/funds/{cik}/track/{key}')
+def fund_track(cik: str, key: str, period: str | None = None):
+    if not db.one('SELECT 1 FROM funds WHERE cik=?', (cik,)):
+        raise HTTPException(404, '없는 기관입니다')
+    return analysis.position_track(cik, key, resolve_period(period))
+
+
 @app.post('/api/refresh')
 async def refresh(request: Request):
     body = await request.json()
