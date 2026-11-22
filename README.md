@@ -10,6 +10,75 @@
 4 매매        등급 → 매매안 → 확인 후 모의 체결 또는 토스 실주문
 ```
 
+## 실행 화면
+
+**펀드 목록**: 추적 중인 기관마다 최신 13F 분기, 평가액, 분기·누적 추정 수익률, 상위 5개 종목 비중, 이번 분기 매매 건수를 보여 줍니다.
+
+![펀드 목록](docs/images/funds.png)
+
+**공통 매매**: 고른 펀드들이 같은 분기에 함께 사고판 종목을 겹친 수 순서로 보여 줍니다. 칸마다 `N` 신규 · `+` 확대 · `−` 축소 · `X` 청산 · `·` 유지입니다. 직전 분기 공시가 없는 펀드는 비교에서 빼고 이유를 표시합니다.
+
+![공통 매매 겹침 지도](docs/images/consensus.png)
+
+**펀드 상세**: 상단 지표 줄과 여섯 개 탭으로 구성됩니다. 상위 보유 탭의 트리맵은 크기가 비중, 색이 직전 분기 대비 주식 수 변화입니다.
+
+![펀드 상세 - 상위 보유](docs/images/fund.png)
+
+성과 이력 탭은 "직전 분기 보유분을 그대로 들고 있었다면"의 추정 수익률을 S&P 500 과 비교합니다.
+
+![펀드 상세 - 성과 이력](docs/images/fund-perf.png)
+
+전체 보유 내역 탭에는 종목별 매매, 분기 주가, 추정 매입가, 손익, 보유 기간이 나옵니다.
+
+![펀드 상세 - 전체 보유 내역](docs/images/fund-all.png)
+
+**리서치**: 공통 매매에서 고른 종목을 TradingAgents 로 한 종목씩 분석해 5단계 등급을 받습니다. 13F 근거(몇 곳 중 몇 곳이 샀는지)를 함께 저장합니다.
+
+![리서치 목록](docs/images/research.png)
+
+보고서는 최종 판단, 트레이더, 분석가 4명, 강세·약세 토론, 리스크 토론까지 에이전트별 탭으로 볼 수 있습니다.
+
+![리서치 보고서](docs/images/research-report.png)
+
+## 아키텍처
+
+Python 프로세스 하나가 웹 서버, 공시 갱신 스케줄러, 리서치 큐를 함께 돌립니다. 단계 사이에는 SQLite 만 두고, 시간이 오래 걸리는 LLM 분석만 별도 프로세스로 실행합니다.
+
+```mermaid
+flowchart LR
+    subgraph EXT[외부 서비스]
+        SEC[(SEC EDGAR)]
+        INFO[(13f.info 미러)]
+        FIGI[(OpenFIGI)]
+        LLM[(LLM API)]
+        TOSS[(토스증권 Open API)]
+    end
+
+    subgraph PROC[Python 프로세스 · 127.0.0.1:8765]
+        direction TB
+        WEB[web/<br/>바닐라 JS · ECharts]
+        SRV[server.py<br/>FastAPI · 스케줄러]
+        SRC[sources.py<br/>1. 공시 수집]
+        ANA[analysis.py<br/>2. 분기 비교 · 공통 매매]
+        RES[research.py<br/>3. 리서치 큐]
+        TRD[trading.py · toss.py<br/>4. 매매안 · 체결]
+        DB[(SQLite · WAL)]
+    end
+
+    WORKER[ta_worker.py<br/>종목당 자식 프로세스]
+
+    WEB <-->|JSON /api| SRV
+    SRV --> SRC & ANA & RES & TRD
+    SRC -->|1순위| SEC
+    SRC -->|차단 시| INFO
+    SRC -->|CUSIP → 티커| FIGI
+    SRC & ANA & RES & TRD --> DB
+    RES -->|subprocess| WORKER --> LLM
+    TRD -->|확인한 주문만| TOSS
+```
+
+모듈마다 왜 그렇게 설계했는지, 데이터 모델, 동시성, 보안, 테스트, 해결한 문제는 **[설계 문서](docs/ARCHITECTURE.md)** 에 정리했습니다.
+
 ## 실행
 
 ```powershell
