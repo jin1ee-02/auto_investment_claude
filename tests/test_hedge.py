@@ -154,6 +154,60 @@ class AnalysisTest(Base):
         self.assertAlmostEqual(r['returnPct'], 5.0)                       # (+20% and -10%) / 2
         self.assertAlmostEqual(r['coveragePct'], 100.0)
 
+    def test_fund_history_against_benchmark(self):
+        q4 = '2025-12-31'
+        put('1', q4, [('AAA', 100, 1000), ('SPY', 10, 1000)])
+        put('1', Q1, [('AAA', 100, 1100), ('SPY', 10, 1050)])
+        put('1', Q2, [('AAA', 200, 2420)])                                # bought more AAA, sold SPY
+        put('2', Q2, [('SPY', 10, 1155)])                                 # SPY still priced by another fund
+        h = analysis.fund_history('1')
+        q = {x['period']: x for x in h['quarters']}
+        self.assertIsNone(q[q4]['returnPct'])                             # nothing to compare with
+        self.assertAlmostEqual(q[Q1]['returnPct'], 7.5)                   # (+10% and +5%) / 2
+        self.assertAlmostEqual(q[Q1]['benchPct'], 5.0)
+        self.assertAlmostEqual(q[Q2]['returnPct'], 10.0)                  # (+10% and +10%) / 2
+        self.assertAlmostEqual(q[Q2]['cumPct'], (1.075 * 1.10 - 1) * 100)
+        self.assertAlmostEqual(q[Q2]['benchCumPct'], (1.05 * 1.10 - 1) * 100)
+        self.assertEqual(h['chained'], 2)
+        self.assertIsNone(h['annualPct'])                                 # under four quarters: not annualised
+        self.assertAlmostEqual(q[Q1]['priceEffect'], 2000 * 0.075)
+        self.assertAlmostEqual(q[Q1]['priceEffect'] + q[Q1]['netFlow'], 2150 - 2000)
+
+    def test_position_history_streak_and_price(self):
+        q3, q4 = '2025-09-30', '2025-12-31'
+        put('1', q3, [('AAA', 100, 1000)])
+        put('1', q4, [('BBB', 10, 100)])                                  # AAA dropped for a quarter
+        put('1', Q1, [('AAA', 100, 1500), ('BBB', 10, 120)])
+        put('1', Q2, [('AAA', 100, 2000), ('BBB', 10, 150)])
+        h = analysis.position_history('1', Q2)['positions']
+        self.assertEqual(h['AAA']['heldQuarters'], 2)                     # streak restarts after the gap
+        self.assertFalse(h['AAA']['heldSinceStart'])
+        self.assertAlmostEqual(h['AAA']['sincePct'], 2000 / 1500 * 100 - 100)
+        self.assertEqual(h['BBB']['heldQuarters'], 3)
+        self.assertAlmostEqual(h['BBB']['sincePct'], 50.0)
+        self.assertAlmostEqual(h['BBB']['quarterPricePct'], 25.0)
+        self.assertEqual(len(h['BBB']['weights']), 4)
+
+    def test_cost_basis(self):
+        self.assertAlmostEqual(analysis.cost_basis([(100, 10), (200, 20)]), 15.0)     # bought 100 @10, 100 @20
+        self.assertAlmostEqual(analysis.cost_basis([(100, 10), (50, 30)]), 10.0)      # a trim keeps the average
+        self.assertAlmostEqual(analysis.cost_basis([(100, 10), (0, 30), (10, 40)]), 40.0)   # exit starts over
+        self.assertIsNone(analysis.cost_basis([(100, None)]))
+        self.assertIsNone(analysis.cost_basis([(100, 10), (0, 12)]))
+
+    def test_position_track_marks_trades_and_breakeven(self):
+        q4 = '2025-12-31'
+        put('1', q4, [('AAA', 100, 1000)])
+        put('1', Q1, [('AAA', 300, 6000)])                                # price 10 -> 20, bought 200
+        put('1', Q2, [('AAA', 150, 3750)])                                # price 25, trimmed half
+        t = analysis.position_track('1', 'AAA', Q2)
+        self.assertEqual([r['action'] for r in t['rows']], ['hold', 'add', 'reduce'])
+        self.assertEqual([r['price'] for r in t['rows']], [10, 20, 25])
+        self.assertAlmostEqual(t['breakeven'], (100 * 10 + 200 * 20) / 300)
+        h = analysis.position_history('1', Q2)['positions']['AAA']
+        self.assertAlmostEqual(h['breakeven'], t['breakeven'])
+        self.assertAlmostEqual(h['plPct'], (25 / t['breakeven'] - 1) * 100)
+
 
 class TradingTest(Base):
     def setUp(self):

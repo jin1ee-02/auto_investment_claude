@@ -142,7 +142,7 @@ input[type=checkbox] { width: 16px; height: 16px; margin: 0; accent-color: var(-
 
 /* ── fund ledger: one row per fund, read across like the track list on the back of a sleeve ── */
 .ledger { overflow: hidden; }
-.ledger-head, .fund { display: grid; grid-template-columns: 16px minmax(220px, 1.5fr) 80px 56px 88px minmax(240px, 1.7fr) max-content; column-gap: 20px; align-items: center; padding: 18px 24px; }
+.ledger-head, .fund { display: grid; grid-template-columns: 16px minmax(220px, 1.5fr) 80px 56px 112px minmax(240px, 1.7fr) max-content; column-gap: 20px; align-items: center; padding: 18px 24px; }
 .ledger-head { padding-block: 12px; font-size: 12px; color: var(--text-3); border-bottom: 1px solid var(--line); }
 .ledger-head .n, .fund .n { text-align: right; }
 .ledger-head .wide.n { width: 340px; }
@@ -167,7 +167,7 @@ input[type=checkbox] { width: 16px; height: 16px; margin: 0; accent-color: var(-
 .minilegend i { display: inline-block; width: 7px; height: 7px; border-radius: 1px; margin-right: 5px; }
 .acts { display: flex; gap: 4px; justify-content: flex-end; font-size: 11px; width: 340px; }
 @media (max-width: 1320px) {
-  .ledger-head, .fund { grid-template-columns: 16px minmax(0, 1fr) 84px 64px 96px; row-gap: 12px; }
+  .ledger-head, .fund { grid-template-columns: 16px minmax(0, 1fr) 84px 64px 112px; row-gap: 12px; }
   .ledger-head .wide { display: none; }
   .fund .alloc { grid-column: 2 / -1; }
   .fund .acts { grid-column: 2 / -1; justify-content: flex-start; width: auto; flex-wrap: wrap; }
@@ -258,6 +258,59 @@ tbody tr.click:hover { background: var(--surface-2); }
 .sticky-bar b { font-family: var(--display); font-weight: 400; font-size: 18px; letter-spacing: .02em; white-space: nowrap; }
 
 .empty { padding: 64px 16px; text-align: center; color: var(--text-2); }
+
+/* ── fund detail: one underline tab bar under the figure strip ── */
+.ftabs { display: flex; gap: 4px; margin: 8px 0 16px; border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: none; }
+.ftabs button { position: relative; flex: none; border: 0; background: none; padding: 12px 16px; color: var(--text-2); font-weight: 500; cursor: pointer; white-space: nowrap; transition: color .15s; }
+.ftabs button:hover { color: var(--text); }
+.ftabs button.on { color: var(--text); font-weight: 600; }
+.ftabs button.on::after { content: ""; position: absolute; left: 12px; right: 12px; bottom: 0; height: 3px; background: var(--mark); }
+.ftabs button:focus-visible { outline-offset: -2px; }
+.chart.tall { height: 520px; }
+.chart-foot { margin: 0; padding: 0 24px 16px; }
+.moves section { padding: 14px 0; border-bottom: 1px solid var(--line); }
+.moves section:first-child { padding-top: 0; }
+.moves section:last-child { border-bottom: 0; padding-bottom: 0; }
+.moves h3 { display: flex; justify-content: space-between; margin-bottom: 10px; font-size: 15px; color: var(--text); }
+.moves h3 span { color: var(--text-3); font-weight: 500; }
+.moves .tag { padding: 3px 9px; font-size: 12px; }
+.structure { row-gap: 12px; }
+.structure .chart { height: 340px; }
+.spark { display: block; }
+.spark polyline { fill: none; stroke: var(--mark); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+tr.cur td { background: color-mix(in srgb, var(--mark) 9%, transparent); }
+
+/* ── fund list: who has filed what ── */
+.figures dd small { font-family: var(--font); font-size: 13px; font-weight: 500; color: var(--text-2); letter-spacing: 0; }
+.recent { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; padding: 14px 24px; }
+.recent h3 { margin-right: 8px; }
+.recent a.chip { transition: border-color .15s, color .15s; }
+.recent a.chip:hover { border-color: var(--line-strong); color: var(--text); }
+.recent a.chip b { color: var(--text); font-weight: 600; }
+.fund-latest { margin-top: 2px; font-size: 11px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fund-latest b { color: var(--text-2); font-weight: 600; }
+.fund-latest .tag { margin-left: 4px; font-size: 10px; padding: 0 5px; }
+.fund .cum { margin-top: 2px; font-size: 11px; font-weight: 400; color: var(--text-3); white-space: nowrap; }
+
+/* ── holdings table: toolbar, double-down tag, and the price track that opens under a row ── */
+.toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.toolbar input[type=search] { width: 200px; border: 1px solid var(--line-strong); background: var(--surface); padding: 5px 10px; border-radius: var(--r-ctl); }
+.toolbar input[type=search]:hover { border-color: var(--text-3); }
+.toolbar #fcount { margin-left: auto; }
+.tag.dd { background: color-mix(in srgb, var(--mark) 22%, transparent); color: var(--text); }
+.tag.dd::before { content: "↘"; color: var(--mark); font-size: 10px; }
+.track { position: sticky; left: 24px; display: grid; grid-template-columns: minmax(0, 1fr) 200px; gap: 16px; align-items: center; }
+.track .chart { height: 240px; }
+.track-side { margin: 0; display: grid; gap: 10px; }
+.track-side dt { font-size: 11px; color: var(--text-3); }
+.track-side dd { margin: 0; font-size: 16px; font-weight: 600; }
+@media (max-width: 760px) { .track { grid-template-columns: 1fr; } .track-side { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 640px) {
+  .tiles { grid-template-columns: 1fr 1fr; }
+  .tile { padding: 14px 16px; }
+  .tile b { font-size: 22px; white-space: normal; }
+  .chart.tall { height: 420px; }
+}
 .empty p { margin: 0 0 12px; }
 .note { font-size: 12px; color: var(--text-2); padding: 10px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-box); }
 .note.warn { border-left: 3px solid var(--warn); }

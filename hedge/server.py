@@ -110,6 +110,16 @@ def summary(cik, period):
     return _summary(cik, period, analysis._version)
 
 
+@lru_cache(maxsize=128)
+def _history(cik, _version):
+    return analysis.fund_history(cik)
+
+
+@lru_cache(maxsize=128)
+def _positions_history(cik, period, _version):
+    return analysis.position_history(cik, period)
+
+
 def research_marks():
     """Latest job per ticker, for badges next to tickers."""
     marks = {}
@@ -143,9 +153,14 @@ def status():
 @app.get('/api/funds')
 def list_funds(period: str | None = None):
     period = resolve_period(period)
-    funds = db.rows('SELECT cik FROM funds ORDER BY featured DESC, name')
-    return {'period': period, 'periodLabel': sources.period_label(period) if period else None,
-            'funds': [summary(f['cik'], period) for f in funds]}
+    funds = [summary(f['cik'], period) for f in db.rows('SELECT cik FROM funds ORDER BY featured DESC, name')]
+    newest = max((f['latestPeriod'] for f in funds if f['latestPeriod']), default=None)
+    filed = sorted((f for f in funds if f['latestFiledAt']), key=lambda f: f['latestFiledAt'], reverse=True)
+    return {'period': period, 'periodLabel': sources.period_label(period) if period else None, 'funds': funds,
+            'newest': newest and {'period': newest, 'label': sources.period_label(newest),
+                                  'filed': sum(1 for f in funds if f['latestPeriod'] == newest)},
+            'recent': [{'cik': f['cik'], 'name': f['name'], 'period': f['latestPeriod'], 'label': f['latestLabel'],
+                        'filedAt': f['latestFiledAt']} for f in filed[:8]]}
 
 
 @app.get('/api/funds/search')
@@ -201,14 +216,27 @@ def fund_detail(cik: str, period: str | None = None, limit: int = 600):
     diff = analysis.fund_diff(cik, period, 1.0)
     positions = diff['positions']
     marks = research_marks()
+    held = _positions_history(cik, period, analysis._version)
     for p in positions:
         mark = marks.get(p['ticker']) if p['ticker'] else None
         p['research'] = {'id': mark['id'], 'status': mark['status'], 'rating': mark['rating']} if mark else None
+        p['hist'] = held['positions'].get(p['key']) if p['kind'] == '' else None
+        if p['hist'] is None and p['kind'] == '' and p['action'] == 'exit':
+            step = analysis.price_step(p['key'], period)
+            p['hist'] = {'quarterPricePct': (step - 1) * 100 if step else None}
     ranked = sorted(positions, key=lambda p: -max(p['value'], p['prevValue']))
     return {'fund': fund, 'period': period, 'periodLabel': sources.period_label(period),
             'prevPeriodLabel': sources.period_label(diff['prevPeriod']), 'hasPrev': bool(diff['prevFiling']),
             'periods': [{'period': p, 'label': sources.period_label(p)} for p in available],
-            'summary': summary(cik, period), 'positions': ranked[:limit], 'totalPositions': len(positions)}
+            'summary': summary(cik, period), 'positions': ranked[:limit], 'totalPositions': len(positions),
+            'history': _history(cik, analysis._version), 'histPeriods': [sources.period_label(p) for p in held['periods']]}
+
+
+@app.get('/api/funds/{cik}/track/{key}')
+def fund_track(cik: str, key: str, period: str | None = None):
+    if not db.one('SELECT 1 FROM funds WHERE cik=?', (cik,)):
+        raise HTTPException(404, '없는 기관입니다')
+    return analysis.position_track(cik, key, resolve_period(period))
 
 
 @app.post('/api/refresh')

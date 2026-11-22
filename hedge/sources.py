@@ -378,7 +378,10 @@ def source_status():
             'active': providers()[0].name}
 
 
-def refresh_fund(cik, quarters=3, force=False):
+HISTORY_QUARTERS = 8     # two years: enough for performance and AUM history
+
+
+def refresh_fund(cik, quarters=HISTORY_QUARTERS, force=False):
     """Fetch the newest `quarters` filings of one fund. Returns the periods stored."""
     cik = str(int(cik))
     last_error = None

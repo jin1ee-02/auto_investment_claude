@@ -50,7 +50,7 @@ def market(prev, cur):
     return _market(prev, cur, _version)
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=32)
 def _market(prev, cur, _v):
     """Implied quarter-end prices and split factors, pooled over every stored fund."""
     data = {}
@@ -156,12 +156,209 @@ def copy_return(cik, period):
     return {'returnPct': gain / covered * 100, 'coveragePct': covered / total * 100}
 
 
+BENCHMARKS = ('SPY', 'IVV', 'VOO')      # S&P 500 ETFs; the first one any tracked fund reports wins
+
+
+def price_step(key, period):
+    """Split-adjusted price ratio of `key` over the quarter ending `period`, or None."""
+    prices, splits = market(previous_period(period), period)
+    p0, p1 = prices.get(key, (None, None))
+    if not p0 or not p1:
+        return None
+    ratio = p1 / p0 * splits.get(key, 1)
+    return ratio if 0.2 <= ratio <= 5 else None
+
+
+def benchmark_return(period):
+    """S&P 500 price return over the quarter, from implied ETF prices in the stored 13F tables."""
+    for key in BENCHMARKS:
+        ratio = price_step(key, period)
+        if ratio:
+            return {'returnPct': (ratio - 1) * 100, 'ticker': key}
+    return None
+
+
+def fund_history(cik):
+    """Per-quarter AUM, position count and estimated return of one fund, oldest first.
+
+    Cumulative return chains only quarters whose estimate exists; `quarters` says how many.
+    The AUM change is split into a price effect (last quarter's book times this quarter's
+    estimated return) and the rest, which is net buying/selling plus whatever the estimate misses.
+    """
+    filings = db.rows('SELECT period, filed_at, total_value, positions FROM filings WHERE cik=? ORDER BY period', (cik,))
+    have = {f['period'] for f in filings}
+    out, cum, bench_cum, n = [], 1.0, 1.0, 0
+    prev_total = None
+    for f in filings:
+        period = f['period']
+        prev = previous_period(period)
+        ret = copy_return(cik, period) if prev in have else None
+        bench = benchmark_return(period) if ret else None
+        rows = db.rows("SELECT value FROM holdings WHERE cik=? AND period=? AND kind='' ORDER BY value DESC", (cik, period))
+        total = f['total_value'] or 0
+        q = {'period': period, 'label': period_label(period), 'filedAt': f['filed_at'], 'totalValue': total,
+             'positions': f['positions'], 'returnPct': ret['returnPct'] if ret else None,
+             'coveragePct': ret['coveragePct'] if ret else None, 'benchPct': bench['returnPct'] if bench else None,
+             'top10Weight': sum(r['value'] for r in rows[:10]) / total * 100 if total else None,
+             'top20Weight': sum(r['value'] for r in rows[:20]) / total * 100 if total else None,
+             'prevTotalValue': prev_total if prev in have else None, 'priceEffect': None, 'netFlow': None}
+        if q['prevTotalValue'] is not None and ret:
+            q['priceEffect'] = q['prevTotalValue'] * ret['returnPct'] / 100
+            q['netFlow'] = total - q['prevTotalValue'] - q['priceEffect']
+        if ret and bench:
+            n += 1
+            cum *= 1 + ret['returnPct'] / 100
+            bench_cum *= 1 + bench['returnPct'] / 100
+        q['cumPct'] = (cum - 1) * 100 if n else None
+        q['benchCumPct'] = (bench_cum - 1) * 100 if n else None
+        out.append(q)
+        prev_total = total
+    years = n / 4
+    return {'quarters': out, 'chained': n,
+            'cumPct': (cum - 1) * 100 if n else None, 'benchCumPct': (bench_cum - 1) * 100 if n else None,
+            # Annualising fewer than four quarters turns one lucky quarter into a silly number.
+            'annualPct': (cum ** (1 / years) - 1) * 100 if n >= 4 else None,
+            'benchAnnualPct': (bench_cum ** (1 / years) - 1) * 100 if n >= 4 else None}
+
+
+def price_path(key, upto, quarters=None):
+    """Implied quarter-end price of `key` for each stored period up to `upto`, on `upto`'s share basis.
+
+    Earlier prices are divided by every split detected after them, so a 2:1 split does not
+    look like a halving. Returns ({period: price or None}, {period: split factor to upto}).
+    """
+    quarters = quarters or [q for q in reversed(periods()) if q <= upto]
+    raw, split = {}, {}
+    for q in quarters:
+        prices, splits = market(previous_period(q), q)
+        raw[q] = prices.get(key, (None, None))[1]
+        split[q] = splits.get(key, 1)
+    adj, factor = {}, 1.0
+    for q in reversed(quarters):
+        adj[q] = factor
+        factor *= split[q]
+    return {q: raw[q] / adj[q] if raw[q] else None for q in quarters}, adj
+
+
+def cost_basis(steps):
+    """Average cost per share of the open position, buying at each quarter-end price.
+
+    steps: [(shares, price)] oldest first, shares and prices on one split basis. Adds are bought
+    at that quarter's price, trims keep the average, and a full exit starts over. None when an
+    add has no price.
+    """
+    cost = held = 0.0
+    unknown = False
+    for shares, price in steps:
+        if shares > held:
+            if price is None:
+                unknown = True
+            else:
+                cost += (shares - held) * price
+        elif shares < held:
+            cost *= shares / held
+        if shares <= 0:
+            cost, unknown = 0.0, False
+        held = shares
+    return None if unknown or held <= 0 else cost / held
+
+
+def position_history(cik, period):
+    """For each share position held at `period`: how long it has been held and how its price moved.
+
+    heldQuarters counts consecutive quarters back from `period`; `heldSinceStart` means the
+    streak reaches the oldest stored filing, so the real holding period may be longer.
+    sincePct is the split-adjusted price change since the first quarter of that streak.
+    breakeven is the estimated average cost (quarter-end prices) and plPct the gain on it at `period`.
+    """
+    fund_periods = [r['period'] for r in db.rows('SELECT period FROM filings WHERE cik=? AND period<=? ORDER BY period',
+                                                 (cik, period))]
+    quarters = [q for q in reversed(periods()) if q <= period]
+    totals = {r['period']: r['total_value'] or 1 for r in db.rows('SELECT period, total_value FROM filings WHERE cik=?', (cik,))}
+    weights, shares = {}, {}
+    for r in db.rows("SELECT period, key, value, shares FROM holdings WHERE cik=? AND kind='' AND period<=?", (cik, period)):
+        weights.setdefault(r['key'], {})[r['period']] = r['value'] / totals[r['period']] * 100
+        shares.setdefault(r['key'], {})[r['period']] = r['shares']
+    out = {}
+    for key, w in weights.items():
+        if period not in w:
+            continue
+        streak, p = [], period
+        while p in w:
+            streak.append(p)
+            p = previous_period(p)
+        first = streak[-1]
+        ratio = 1.0
+        for q in streak[:-1]:          # price moves of every quarter after the first one held
+            step = price_step(key, q)
+            if step is None:
+                ratio = None
+                break
+            ratio *= step
+        quarter = price_step(key, period)
+        price, adj = price_path(key, period, quarters)
+        cost = cost_basis([(shares[key].get(q, 0) * adj.get(q, 1), price.get(q)) for q in fund_periods])
+        now = price.get(period)
+        out[key] = {'heldQuarters': len(streak), 'firstPeriod': first, 'heldSinceStart': first == fund_periods[0],
+                    'sincePct': (ratio - 1) * 100 if ratio is not None and len(streak) > 1 else None,
+                    'quarterPricePct': (quarter - 1) * 100 if quarter else None,
+                    'price': now, 'breakeven': cost,
+                    'plPct': (now / cost - 1) * 100 if cost and now else None,
+                    'weights': [round(w.get(q, 0), 3) for q in fund_periods]}
+    return {'periods': fund_periods, 'positions': out}
+
+
+def position_track(cik, key, period):
+    """One position over every stored quarter: price, the fund's shares, and what it did each quarter."""
+    quarters = [q for q in reversed(periods()) if q <= period]
+    price, adj = price_path(key, period, quarters)
+    filed = {r['period'] for r in db.rows('SELECT period FROM filings WHERE cik=?', (cik,))}
+    held = {r['period']: r['shares'] for r in db.rows("SELECT period, shares FROM holdings WHERE cik=? AND key=? AND kind=''",
+                                                      (cik, key))}
+    rows, steps, prev = [], [], None
+    for q in quarters:
+        sh = held.get(q, 0) * adj[q] if q in filed else None
+        action = None
+        if sh is not None and prev is not None:
+            if prev == 0 and sh > 0:
+                action = 'new'
+            elif prev > 0 and sh == 0:
+                action = 'exit'
+            elif prev > 0 and abs(sh / prev - 1) >= 0.01:
+                action = 'add' if sh > prev else 'reduce'
+            elif sh > 0:
+                action = 'hold'
+        elif sh:
+            action = 'hold'
+        if sh is not None:
+            steps.append((sh, price[q]))
+            prev = sh
+        rows.append({'period': q, 'label': period_label(q), 'price': price[q], 'shares': sh,
+                     'value': sh * price[q] if sh and price[q] else None, 'action': action, 'filed': q in filed})
+    return {'key': key, 'rows': rows, 'breakeven': cost_basis(steps)}
+
+
+def track_record(cik, period):
+    """Chained estimated return of `cik` up to `period`, for the fund list."""
+    linked = [q for q in fund_history(cik)['quarters'] if q['period'] <= period and q['returnPct'] is not None
+              and q['benchPct'] is not None]
+    if not linked:
+        return None
+    n, last = len(linked), linked[-1]
+    return {'quarters': n, 'cumPct': last['cumPct'], 'benchCumPct': last['benchCumPct'],
+            'annualPct': ((1 + last['cumPct'] / 100) ** (4 / n) - 1) * 100 if n >= 4 else None,
+            'from': period_label(previous_period(linked[0]['period']))}
+
+
 def fund_summary(fund, period):
     """Card data for the fund list."""
     cik = fund['cik']
     filing = db.one('SELECT * FROM filings WHERE cik=? AND period=?', (cik, period)) if period else None
-    out = {**fund, 'period': period, 'hasData': bool(filing),
-           'periods': [r['period'] for r in db.rows('SELECT period FROM filings WHERE cik=? ORDER BY period DESC', (cik,))]}
+    filed = db.rows('SELECT period, filed_at FROM filings WHERE cik=? ORDER BY period DESC', (cik,))
+    out = {**fund, 'period': period, 'hasData': bool(filing), 'periods': [r['period'] for r in filed],
+           'latestPeriod': filed[0]['period'] if filed else None,
+           'latestLabel': period_label(filed[0]['period']) if filed else None,
+           'latestFiledAt': filed[0]['filed_at'] if filed else None}
     if not filing:
         return out
     diff = fund_diff(cik, period, 1.0)
@@ -177,6 +374,8 @@ def fund_summary(fund, period):
         'prevTotalValue': diff['prevFiling']['total_value'] if diff['prevFiling'] else None,
         'top': [{'label': p['ticker'] or p['name'], 'weight': p['weight']} for p in longs[:5]],
         'top10Weight': sum(p['weight'] for p in longs[:10]),
+        'top20Weight': sum(p['weight'] for p in longs[:20]),
+        'track': track_record(cik, period),
         'counts': counts, 'turnover': turnover, 'copyReturn': copy_return(cik, period),
     })
     return out
