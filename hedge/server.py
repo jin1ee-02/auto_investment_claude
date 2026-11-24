@@ -6,8 +6,6 @@ origin, so another website open in the same browser cannot trigger a refresh or 
 import datetime as dt
 import threading
 import time
-from functools import lru_cache
-
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -70,12 +68,14 @@ def _refresh_worker(funds, force):
         for fund in funds:
             _refresh['current'] = fund['name']
             try:
-                sources.refresh_fund(fund['cik'], force=force)
+                # Clear cached analysis only when something was stored: a routine refresh that finds
+                # nothing new must not make every page recompute from scratch while it runs.
+                if sources.refresh_fund(fund['cik'], force=force)[1]:
+                    analysis.invalidate()
             except sources.SourceError as exc:
                 _refresh['errors'].append({'cik': fund['cik'], 'name': fund['name'], 'error': str(exc)})
             except Exception as exc:
                 _refresh['errors'].append({'cik': fund['cik'], 'name': fund['name'], 'error': f'{type(exc).__name__}: {exc}'})
-            analysis.invalidate()
             _refresh['done'] += 1
     finally:
         db.kv_set('last_refresh', time.time())
@@ -100,32 +100,23 @@ def resolve_period(period):
     return analysis.default_period()
 
 
-@lru_cache(maxsize=512)
-def _summary(cik, period, _version):
+def fund_or_404(cik):
     fund = db.one('SELECT * FROM funds WHERE cik=?', (cik,))
-    return analysis.fund_summary(fund, period) if fund else None
+    if not fund:
+        raise HTTPException(404, '없는 기관입니다')
+    return fund
 
 
-def summary(cik, period):
-    return _summary(cik, period, analysis._version)
+def attach_research(items):
+    """Give each item with a ticker the newest research job on it, for the badge next to it."""
+    marks = research.latest_marks()
+    for item in items:
+        item['research'] = marks.get(item['ticker']) if item['ticker'] else None
+    return items
 
 
-@lru_cache(maxsize=128)
-def _history(cik, _version):
-    return analysis.fund_history(cik)
-
-
-@lru_cache(maxsize=128)
-def _positions_history(cik, period, _version):
-    return analysis.position_history(cik, period)
-
-
-def research_marks():
-    """Latest job per ticker, for badges next to tickers."""
-    marks = {}
-    for r in db.rows('SELECT id,ticker,status,rating,stage,finished_at FROM research ORDER BY id'):
-        marks[r['ticker']] = r
-    return marks
+def fresh_days():
+    return int(trading.settings()['freshDays'])
 
 
 def selection():
@@ -153,7 +144,7 @@ def status():
 @app.get('/api/funds')
 def list_funds(period: str | None = None):
     period = resolve_period(period)
-    funds = [summary(f['cik'], period) for f in db.rows('SELECT cik FROM funds ORDER BY featured DESC, name')]
+    funds = [analysis.fund_summary(f['cik'], period) for f in db.rows('SELECT cik FROM funds ORDER BY featured DESC, name')]
     newest = max((f['latestPeriod'] for f in funds if f['latestPeriod']), default=None)
     filed = sorted((f for f in funds if f['latestFiledAt']), key=lambda f: f['latestFiledAt'], reverse=True)
     return {'period': period, 'periodLabel': sources.period_label(period) if period else None, 'funds': funds,
@@ -185,7 +176,7 @@ async def add_fund(request: Request):
     if db.one('SELECT 1 FROM funds WHERE cik=?', (cik,)):
         raise HTTPException(409, '이미 추가된 기관입니다')
     try:
-        periods = sources.refresh_fund(cik)     # verifies the CIK and stores its filings
+        periods, _changed = sources.refresh_fund(cik)     # verifies the CIK and stores its filings
     except sources.SourceError as exc:
         db.run('DELETE FROM funds WHERE cik=? AND last_refresh IS NULL', (cik,))
         raise HTTPException(404, f'13F 공시를 가져오지 못했습니다: {exc}')
@@ -206,20 +197,17 @@ def remove_fund(cik: str):
 
 @app.get('/api/funds/{cik}')
 def fund_detail(cik: str, period: str | None = None, limit: int = 600):
-    fund = db.one('SELECT * FROM funds WHERE cik=?', (cik,))
-    if not fund:
-        raise HTTPException(404, '없는 기관입니다')
+    fund = fund_or_404(cik)
     available = [r['period'] for r in db.rows('SELECT period FROM filings WHERE cik=? ORDER BY period DESC', (cik,))]
     if not available:
         return {'fund': fund, 'periods': [], 'summary': None, 'positions': []}
-    period = period if period in available else (resolve_period(None) if resolve_period(None) in available else available[0])
+    if period not in available:
+        default = resolve_period(None)
+        period = default if default in available else available[0]
     diff = analysis.fund_diff(cik, period, 1.0)
-    positions = diff['positions']
-    marks = research_marks()
-    held = _positions_history(cik, period, analysis._version)
+    positions = attach_research(diff['positions'])
+    held = analysis.position_history(cik, period)
     for p in positions:
-        mark = marks.get(p['ticker']) if p['ticker'] else None
-        p['research'] = {'id': mark['id'], 'status': mark['status'], 'rating': mark['rating']} if mark else None
         p['hist'] = held['positions'].get(p['key']) if p['kind'] == '' else None
         if p['hist'] is None and p['kind'] == '' and p['action'] == 'exit':
             step = analysis.price_step(p['key'], period)
@@ -228,14 +216,13 @@ def fund_detail(cik: str, period: str | None = None, limit: int = 600):
     return {'fund': fund, 'period': period, 'periodLabel': sources.period_label(period),
             'prevPeriodLabel': sources.period_label(diff['prevPeriod']), 'hasPrev': bool(diff['prevFiling']),
             'periods': [{'period': p, 'label': sources.period_label(p)} for p in available],
-            'summary': summary(cik, period), 'positions': ranked[:limit], 'totalPositions': len(positions),
-            'history': _history(cik, analysis._version), 'histPeriods': [sources.period_label(p) for p in held['periods']]}
+            'summary': analysis.fund_summary(cik, period), 'positions': ranked[:limit], 'totalPositions': len(positions),
+            'history': analysis.fund_history(cik), 'histPeriods': [sources.period_label(p) for p in held['periods']]}
 
 
 @app.get('/api/funds/{cik}/track/{key}')
 def fund_track(cik: str, key: str, period: str | None = None):
-    if not db.one('SELECT 1 FROM funds WHERE cik=?', (cik,)):
-        raise HTTPException(404, '없는 기관입니다')
+    fund_or_404(cik)
     return analysis.position_track(cik, key, resolve_period(period))
 
 
@@ -263,11 +250,8 @@ def consensus(period: str | None = None, minChange: float = 5.0, limit: int = 15
     if not period or not ciks:
         return {'period': period, 'funds': [], 'missing': [], 'buys': [], 'sells': [], 'minChange': minChange}
     result = analysis.consensus(ciks, period, max(0.0, min(minChange, 100.0)))
-    marks = research_marks()
-    rows = result.pop('rows')
+    rows = attach_research(result.pop('rows'))
     for row in rows:
-        mark = marks.get(row['ticker']) if row['ticker'] else None
-        row['research'] = {'id': mark['id'], 'status': mark['status'], 'rating': mark['rating']} if mark else None
         row['researchable'] = research.is_us_ticker(row['ticker'])
     buys = sorted((r for r in rows if r['buyCount']), key=lambda r: (-r['buyCount'], -r['newCount'], -r['buyWeightDelta']))
     sells = sorted((r for r in rows if r['sellCount']), key=lambda r: (-r['sellCount'], -r['exitCount'], r['sellWeightDelta']))
@@ -278,7 +262,7 @@ def consensus(period: str | None = None, minChange: float = 5.0, limit: int = 15
 
 @app.get('/api/research')
 def research_list():
-    return {'jobs': research.list_jobs(), 'config': config.research_config()}
+    return {'jobs': research.list_jobs(), 'config': {**config.research_config(), 'freshDays': fresh_days()}}
 
 
 @app.post('/api/research')
@@ -288,7 +272,7 @@ async def research_enqueue(request: Request):
     if not isinstance(tickers, list) or not 1 <= len(tickers) <= 20:
         raise HTTPException(400, '한 번에 1~20개 종목을 요청할 수 있습니다')
     try:
-        return research.enqueue(tickers, body.get('context') or {}, bool(body.get('force')))
+        return research.enqueue(tickers, body.get('context') or {}, bool(body.get('force')), fresh_days())
     except ValueError as exc:
         raise HTTPException(400, str(exc))
 

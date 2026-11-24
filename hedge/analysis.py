@@ -8,9 +8,9 @@ between two snapshots. Three things keep that difference honest:
 * tiny changes  - index-like rebalancing below `min_change` percent counts as HOLD.
 * options       - PUT/CALL rows are shown per fund but never count as buying or selling.
 """
+import functools
 import statistics
 import threading
-from functools import lru_cache
 
 from . import db
 from .sources import period_label, previous_period
@@ -30,6 +30,22 @@ def invalidate():
         _version += 1
 
 
+def versioned(maxsize):
+    """lru_cache that starts over whenever `invalidate()` is called.
+
+    Results are shared between callers, so callers must not mutate what they get back.
+    """
+    def wrap(fn):
+        cache = functools.lru_cache(maxsize)(lambda _v, *args: fn(*args))
+
+        @functools.wraps(fn)
+        def cached(*args):
+            return cache(_version, *args)
+        cached.uncached = fn
+        return cached
+    return wrap
+
+
 def periods():
     return [r['period'] for r in db.rows('SELECT DISTINCT period FROM filings ORDER BY period DESC')]
 
@@ -46,17 +62,25 @@ def default_period():
     return counts[0]['period']
 
 
+def change_action(prev_shares, shares, min_change):
+    """add / reduce / hold for a position held in both quarters, and the share change in percent.
+
+    Changes smaller than `min_change` percent (index-like rebalancing) count as hold.
+    """
+    change = (shares / prev_shares - 1) * 100 if prev_shares else 0.0
+    threshold = max(min_change, 0.01)
+    return ('add' if change >= threshold else 'reduce' if change <= -threshold else 'hold'), change
+
+
+@versioned(maxsize=32)
 def market(prev, cur):
-    return _market(prev, cur, _version)
-
-
-@lru_cache(maxsize=32)
-def _market(prev, cur, _v):
     """Implied quarter-end prices and split factors, pooled over every stored fund."""
     data = {}
-    for r in db.rows("SELECT period, key, cik, value, shares FROM holdings WHERE kind='' AND shares>0 AND value>0 "
-                     'AND period IN (?,?)', (prev, cur)):
-        data.setdefault(r['key'], {}).setdefault(r['period'], {})[r['cik']] = (r['value'], r['shares'])
+    # Every holding of two quarters: read as plain tuples, which is several times faster than dict rows.
+    for period, key, cik, value, shares in db.run(
+            "SELECT period, key, cik, value, shares FROM holdings WHERE kind='' AND shares>0 AND value>0 "
+            'AND period IN (?,?)', (prev, cur)):
+        data.setdefault(key, {}).setdefault(period, {})[cik] = (value, shares)
     prices, splits = {}, {}
     for key, by_period in data.items():
         p = {period: statistics.median(v / s for v, s in holders.values()) for period, holders in by_period.items()}
@@ -67,7 +91,12 @@ def _market(prev, cur, _v):
         if len(both) < 2:
             continue
         price_ratio = p[cur] / p[prev]
+        # Two thirds of holders sitting on the factor puts the median on it too, so only
+        # factors next to the median can qualify; that skips the scan for almost every key.
+        mid = statistics.median(both)
         for f in SPLIT_FACTORS:
+            if abs(mid / f - 1) >= 0.01:
+                continue
             hits = sum(1 for ratio in both if abs(ratio / f - 1) < 0.01)
             # A split keeps value roughly constant: the split-adjusted price move must be an
             # ordinary quarterly move, and most continuing holders must show exactly the factor.
@@ -107,8 +136,7 @@ def fund_diff(cik, period, min_change=0.0):
         elif not now:
             action, change = 'exit', -100.0
         else:
-            change = (shares / prev_shares - 1) * 100 if prev_shares else 0.0
-            action = 'add' if change >= max(min_change, 0.01) else 'reduce' if change <= -max(min_change, 0.01) else 'hold'
+            action, change = change_action(prev_shares, shares, min_change)
         if action == 'exit':
             trade_value = -prev_value
         elif action == 'new':
@@ -178,17 +206,24 @@ def benchmark_return(period):
     return None
 
 
+def annualise(cum_pct, quarters):
+    """Chained return per year. Fewer than four quarters would turn one lucky quarter into a silly number."""
+    return ((1 + cum_pct / 100) ** (4 / quarters) - 1) * 100 if quarters >= 4 else None
+
+
+@versioned(maxsize=128)
 def fund_history(cik):
     """Per-quarter AUM, position count and estimated return of one fund, oldest first.
 
-    Cumulative return chains only quarters whose estimate exists; `quarters` says how many.
+    Cumulative return chains only quarters whose estimate exists; `chained` says how many,
+    overall and up to each quarter, so a view of an earlier quarter can read its own chain.
     The AUM change is split into a price effect (last quarter's book times this quarter's
     estimated return) and the rest, which is net buying/selling plus whatever the estimate misses.
     """
     filings = db.rows('SELECT period, filed_at, total_value, positions FROM filings WHERE cik=? ORDER BY period', (cik,))
     have = {f['period'] for f in filings}
     out, cum, bench_cum, n = [], 1.0, 1.0, 0
-    prev_total = None
+    prev_total = first_linked = None
     for f in filings:
         period = f['period']
         prev = previous_period(period)
@@ -209,16 +244,17 @@ def fund_history(cik):
             n += 1
             cum *= 1 + ret['returnPct'] / 100
             bench_cum *= 1 + bench['returnPct'] / 100
+            first_linked = first_linked or period
+        q['chained'] = n
         q['cumPct'] = (cum - 1) * 100 if n else None
         q['benchCumPct'] = (bench_cum - 1) * 100 if n else None
+        q['annualPct'] = annualise(q['cumPct'], n) if n else None
+        q['benchAnnualPct'] = annualise(q['benchCumPct'], n) if n else None
         out.append(q)
         prev_total = total
-    years = n / 4
-    return {'quarters': out, 'chained': n,
-            'cumPct': (cum - 1) * 100 if n else None, 'benchCumPct': (bench_cum - 1) * 100 if n else None,
-            # Annualising fewer than four quarters turns one lucky quarter into a silly number.
-            'annualPct': (cum ** (1 / years) - 1) * 100 if n >= 4 else None,
-            'benchAnnualPct': (bench_cum ** (1 / years) - 1) * 100 if n >= 4 else None}
+    last = out[-1] if out else {}
+    return {'quarters': out, 'chained': n, 'firstLinked': first_linked,
+            **{k: last.get(k) for k in ('cumPct', 'benchCumPct', 'annualPct', 'benchAnnualPct')}}
 
 
 def price_path(key, upto, quarters=None):
@@ -263,6 +299,7 @@ def cost_basis(steps):
     return None if unknown or held <= 0 else cost / held
 
 
+@versioned(maxsize=128)
 def position_history(cik, period):
     """For each share position held at `period`: how long it has been held and how its price moved.
 
@@ -324,10 +361,8 @@ def position_track(cik, key, period):
                 action = 'new'
             elif prev > 0 and sh == 0:
                 action = 'exit'
-            elif prev > 0 and abs(sh / prev - 1) >= 0.01:
-                action = 'add' if sh > prev else 'reduce'
-            elif sh > 0:
-                action = 'hold'
+            elif prev > 0:
+                action = change_action(prev, sh, 1.0)[0]     # the same 1% the fund detail table uses
         elif sh:
             action = 'hold'
         if sh is not None:
@@ -340,19 +375,21 @@ def position_track(cik, key, period):
 
 def track_record(cik, period):
     """Chained estimated return of `cik` up to `period`, for the fund list."""
-    linked = [q for q in fund_history(cik)['quarters'] if q['period'] <= period and q['returnPct'] is not None
-              and q['benchPct'] is not None]
-    if not linked:
+    history = fund_history(cik)
+    upto = [q for q in history['quarters'] if q['period'] <= period and q['chained']]
+    if not upto:
         return None
-    n, last = len(linked), linked[-1]
-    return {'quarters': n, 'cumPct': last['cumPct'], 'benchCumPct': last['benchCumPct'],
-            'annualPct': ((1 + last['cumPct'] / 100) ** (4 / n) - 1) * 100 if n >= 4 else None,
-            'from': period_label(previous_period(linked[0]['period']))}
+    last = upto[-1]
+    return {'quarters': last['chained'], 'cumPct': last['cumPct'], 'benchCumPct': last['benchCumPct'],
+            'annualPct': last['annualPct'], 'from': period_label(previous_period(history['firstLinked']))}
 
 
-def fund_summary(fund, period):
-    """Card data for the fund list."""
-    cik = fund['cik']
+@versioned(maxsize=512)
+def fund_summary(cik, period):
+    """Card data for the fund list; None for an unknown fund."""
+    fund = db.one('SELECT * FROM funds WHERE cik=?', (cik,))
+    if not fund:
+        return None
     filing = db.one('SELECT * FROM filings WHERE cik=? AND period=?', (cik, period)) if period else None
     filed = db.rows('SELECT period, filed_at FROM filings WHERE cik=? ORDER BY period DESC', (cik,))
     out = {**fund, 'period': period, 'hasData': bool(filing), 'periods': [r['period'] for r in filed],

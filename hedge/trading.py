@@ -278,8 +278,7 @@ def _fill_paper(order):
             c.execute('UPDATE paper_positions SET quantity=? WHERE symbol=?', (owned - quantity, symbol))
             c.execute('DELETE FROM paper_positions WHERE quantity<=0')
             cash += quantity * price
-        c.execute('INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-                  ('paper_cash', repr(float(cash))))
+        db.kv_set('paper_cash', float(cash), cursor=c)
         return _record('paper', order, 'filled', note='모의 체결 (지정가 기준)', cursor=c)
 
 
