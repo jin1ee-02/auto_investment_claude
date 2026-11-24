@@ -12,6 +12,8 @@
 
 ## 실행 화면
 
+흑백 다크 대시보드입니다. 색은 상승(빨강)·하락(파랑)과 차트 계열에만 쓰고, 숫자는 고정폭 글꼴로 자릿수를 맞춥니다.
+
 **펀드 목록**: 추적 중인 기관마다 최신 13F 분기, 평가액, 분기·누적 추정 수익률, 상위 5개 종목 비중, 이번 분기 매매 건수를 보여 줍니다.
 
 ![펀드 목록](docs/images/funds.png)
@@ -32,7 +34,7 @@
 
 ![펀드 상세 - 전체 보유 내역](docs/images/fund-all.png)
 
-**리서치**: 공통 매매에서 고른 종목을 TradingAgents 로 한 종목씩 분석해 5단계 등급을 받습니다. 13F 근거(몇 곳 중 몇 곳이 샀는지)를 함께 저장합니다.
+**리서치**: 공통 매매에서 고른 종목을 TradingAgents 로 한 종목씩 분석해 5단계 등급을 받습니다. 13F 근거(몇 곳 중 몇 곳이 샀는지)를 함께 저장합니다. 아래는 2026 Q3 공통 매수 상위 두 종목을 TradingAgents v0.7.1 로 실제로 돌린 결과입니다. META(29곳 중 매수 9 · 매도 8)는 **Underweight**, MA(매수 8 · 매도 2)는 **Hold** 가 나왔고 종목당 약 3분 걸렸습니다.
 
 ![리서치 목록](docs/images/research.png)
 
@@ -108,7 +110,7 @@ Copy-Item .env.example .env            # 값 채우기
 | `TOSS_CLIENT_ID`, `TOSS_CLIENT_SECRET`, `TOSS_ACCOUNT_SEQ` | 토스증권 Open API. WTS > 설정 > Open API 에서 이 PC 의 공인 IP 를 허용해야 합니다 |
 | `TOSS_ENABLE_LIVE` | `true` 일 때만 실주문 전송 가능. 기본 `false` |
 
-Claude 로 리서치하려면 `RESEARCH_PROVIDER=anthropic`, 모델 ID(예: `claude-opus-5-5` / `claude-haiku-4-5-20251001`), `ANTHROPIC_API_KEY` 를 넣으면 됩니다.
+Claude 로 리서치하려면 `RESEARCH_PROVIDER=anthropic`, 모델 ID(예: 심층 `claude-opus-5-5` / 빠른 `claude-haiku-5-5`), `ANTHROPIC_API_KEY` 를 넣으면 됩니다.
 
 ## 동작 방식
 
@@ -118,6 +120,7 @@ Claude 로 리서치하려면 `RESEARCH_PROVIDER=anthropic`, 모델 ID(예: `cla
 - 펀드마다 최근 8개 분기(2년)를 저장합니다. 성과 이력·운용 규모 탭이 이 기간을 씁니다. 한 분기에 정정 공시가 여러 개면 가장 늦게 제출된 "전체 재작성본"을 쓰고, 일부 종목만 추가한 정정은 건너뜁니다.
 - CUSIP 마다 티커를 하나로 고정합니다. 분기마다 수집 경로가 달라도 같은 종목이 같은 키로 비교됩니다.
 - 서버가 켜져 있으면 12시간마다 새 공시를 확인합니다. 새 분기(예: 11월 중순의 3분기 공시)가 들어오면 분기 선택에 자동으로 나타납니다.
+- 분석 결과는 메모리에 캐시하고, 갱신에서 실제로 새로 저장된 공시가 있을 때만 캐시를 비웁니다. 새 공시가 없는 정기 확인 중에도 화면이 느려지지 않습니다.
 
 ### 2. 분기 비교와 공통 매매 — `hedge/analysis.py`
 
@@ -152,11 +155,11 @@ Claude 로 리서치하려면 `RESEARCH_PROVIDER=anthropic`, 모델 ID(예: `cla
 
 ### 3. 리서치 — `hedge/research.py`, `hedge/ta_worker.py`
 
-[TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents) 를 커밋 고정으로 설치해 **그래프를 수정하지 않고** 사용합니다
+[TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents) **v0.7.1** 을 릴리스 커밋에 고정해 설치하고 **그래프를 수정하지 않고** 사용합니다
 (시장·소셜·뉴스·재무 분석가 → 강세/약세 토론 → 트레이더 → 리스크 토론 → 포트폴리오 매니저).
 
 - 한 번에 한 종목씩, 종목마다 별도 프로세스로 실행합니다. 진행 단계가 화면에 표시되고 중간에 취소할 수 있습니다.
-- 같은 종목의 완료된 결과는 14일간 재사용합니다("다시"를 누르면 새로 실행).
+- 같은 종목의 완료된 결과는 **리서치 유효 일수**(매매 탭 설정, 기본 14일) 동안 재사용합니다. 매매안도 같은 기간 안의 등급만 씁니다("다시"를 누르면 새로 실행).
 - 미국 상장 티커만 대상입니다(`BN.TO` 같은 해외 상장 표기는 제외).
 - 리서치는 주문을 내지 않습니다. 결과는 등급과 보고서뿐입니다.
 
