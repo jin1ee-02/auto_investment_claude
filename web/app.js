@@ -102,6 +102,14 @@ function renderBanner() {
     b.innerHTML = `<span>13F 공시 확인 중 · ${esc(r.current)} (${r.done}/${r.total})</span><span class="bar"><i style="width:${r.total ? r.done / r.total * 100 : 0}%"></i></span>`;
     clearTimeout(renderBanner.t);
     renderBanner.t = setTimeout(async () => { await loadStatus(); if (!state.status.refresh.running) { toast(refreshSummary()); route(); } }, 1500);
+  } else if (state.status.backfill?.running) {
+    const k = state.status.backfill;
+    b.hidden = false;
+    b.innerHTML = k.done < k.total
+      ? `<span>매입가 계산용 과거 13F 수집 중 · ${esc(k.current)} (${k.done}/${k.total}) · 처음 한 번만 하며, 그동안 매입가는 최근 분기 기준입니다</span><span class="bar"><i style="width:${k.done / k.total * 100}%"></i></span>`
+      : `<span>매입가 계산용 · ${esc(k.current)}</span>`;
+    clearTimeout(renderBanner.t);
+    renderBanner.t = setTimeout(async () => { await loadStatus(); if (!state.status.backfill.running) { toast('매입가 기록 갱신 완료 · 전체 13F 기록과 주식 분할을 반영해 다시 계산했습니다'); route(); } }, 5000);
   } else if (r.errors?.length) {
     b.hidden = false;
     b.innerHTML = `<span>최근 새로고침에서 ${r.errors.length}개 기관을 가져오지 못했습니다: ${esc(r.errors.slice(0, 3).map((e) => `${e.name} (${e.error})`).join(' · '))}</span>`;
@@ -260,6 +268,9 @@ const axis = (extra = {}) => ({ axisLine: { lineStyle: { color: css('--line-stro
 // Value axis whose labels use `formatter` ('{value}%', fmtUsd …); every chart shares the same look.
 const valueAxis = (formatter, extra = {}) => ({ type: 'value', ...axis(), axisLabel: { color: css('--text-2'), fontSize: 11, formatter }, ...extra });
 const legend = (extra = {}) => ({ top: 4, right: 12, textStyle: { color: css('--text-2'), fontSize: 11 }, itemWidth: 10, itemHeight: 10, ...extra });
+// Estimated cost; a position already open in the fund's first 13F on record gets a * (its earlier buys are priced at that quarter).
+const basisHtml = (h) => !h?.breakeven ? '–' : fmtMoney(h.breakeven) + (h.basisFromLabel
+  ? ` <span class="faint" title="${esc(h.basisFromLabel)} 이전부터 보유: 그때까지 산 주식은 ${esc(h.basisFromLabel)} 말 가격으로 계산">*</span>` : '');
 const heldLabel = (h) => h?.heldQuarters ? `${h.heldQuarters}${h.heldSinceStart ? '+' : ''}분기` : null;
 const arrow = (v, d = 1) => v == null ? '' : `${v >= 0 ? '▲' : '▼'}${Math.abs(v).toFixed(d)}%`;
 const usdSigned = (v) => v == null ? '–' : `<span class="${v > 0 ? 'pos' : v < 0 ? 'neg' : ''}">${v > 0 ? '+' : ''}${fmtUsd(v)}</span>`;
@@ -421,7 +432,7 @@ const FUND_VIEWS = {
     const sized = SIZES.map(([, lo, hi]) => sh.filter((p) => p.weight >= lo && p.weight < hi));
     barChart($('#sizes'), SIZES.map(([l]) => l), sized.map((g) => g.reduce((t, p) => t + p.weight, 0)), sized.map((g) => `${g.length}종목`), css('--s2'));
     const ks = Array.from({ length: nq }, (_, i) => i + 1);
-    const held = ks.map((k) => sh.filter((p) => (p.hist?.heldQuarters || 1) === k));
+    const held = ks.map((k) => sh.filter((p) => Math.min(p.hist?.heldQuarters || 1, nq) === k));   // the last bucket is nq or longer
     barChart($('#held'), ks.map((k) => k === 1 ? '이번 분기' : k === nq ? `${k}분기+` : `${k}분기`), held.map((g) => g.reduce((t, p) => t + p.weight, 0)), held.map((g) => `${g.length}종목`), css('--s3'));
   },
 
@@ -508,8 +519,8 @@ const FUND_VIEWS = {
       <span class="faint small" id="fcount"></span></div>
       <div class="table-wrap" style="max-height:720px"><table id="ftable"></table></div></div>
       <p class="note" style="margin-top:16px">행을 누르면 분기 말 가격과 이 펀드의 보유 주식 수, 매수·매도 시점을 볼 수 있습니다.
-      <b>추정 매입가</b>는 주식 수가 늘어난 분기마다 그 분기 말 가격에 샀다고 보고 계산한 평균 단가이고(분할 보정), <b>손익</b>은 ${esc(d.periodLabel)} 분기 말 가격 기준입니다.
-      수집된 첫 분기부터 보유한 종목(보유 기간에 +)은 그 분기 가격을 매입가로 씁니다. <b>하락 중 추가</b>는 이번 분기 주가가 5% 넘게 내렸는데 주식 수를 늘린 종목입니다.</p>`;
+      <b>추정 매입가</b>는 이 펀드의 13F 전체 기록(2013년 이후)에서 주식 수가 늘어난 분기마다 그 분기 말 가격에 샀다고 보고 계산한 평균 단가이고(분할 보정), <b>손익</b>은 ${esc(d.periodLabel)} 분기 말 가격 기준입니다.
+      기록된 첫 분기부터 보유한 종목(보유 기간에 +, 매입가에 *)은 그때까지 산 주식을 그 분기 가격으로 계산합니다. <b>하락 중 추가</b>는 이번 분기 주가가 5% 넘게 내렸는데 주식 수를 늘린 종목입니다.</p>`;
     const filters = {
       all: ['전체', () => true], new: ['신규', (p) => p.action === 'new'], add: ['확대', (p) => p.action === 'add'], reduce: ['축소', (p) => p.action === 'reduce'],
       exit: ['청산', (p) => p.action === 'exit'], dd: ['하락 중 추가', doubledDown], opt: ['옵션', (p) => p.kind === 'PUT' || p.kind === 'CALL'],
@@ -525,7 +536,7 @@ const FUND_VIEWS = {
       $('#fcount').textContent = `${fmtNum(shown.length)}행${d.totalPositions > d.positions.length ? ` · 평가액 상위 ${d.positions.length}개 중 (전체 ${fmtNum(d.totalPositions)}개)` : ''}`;
       $('#ftable').innerHTML = `<thead><tr><th>종목</th><th></th><th class="r">비중</th><th class="r">평가액</th><th class="r">주식 수</th><th>변화</th><th class="r">주식 수 변화</th><th class="r">비중 변화</th><th class="r">추정 매매액</th>
         <th class="r">분기 주가</th><th class="r" title="주식 수가 늘어난 분기마다 분기 말 가격에 샀다고 본 평균 단가">추정 매입가</th><th class="r" title="${esc(d.periodLabel)} 분기 말 가격 기준">손익</th>
-        <th class="r" title="연속 보유 분기 수. +는 수집된 첫 분기부터 보유">보유</th><th title="${esc(span)}">비중 추이</th><th>리서치</th></tr></thead>
+        <th class="r" title="연속 보유 분기 수. +는 기록된 첫 13F 분기부터 보유">보유</th><th title="${esc(span)}">비중 추이</th><th>리서치</th></tr></thead>
         <tbody>${shown.map((p, i) => `<tr class="${p.kind === '' ? 'click' : ''}" data-i="${i}" ${p.kind === '' ? 'aria-expanded="false" title="가격·매매 이력 펼치기"' : ''}>
           <td><span class="tk">${esc(p.ticker || p.cusip)}</span>${p.kind ? ` <span class="tag">${p.kind}</span>` : ''}${p.split ? ` <span class="tag" title="주식 분할을 감지해 직전 주식 수를 보정했습니다">분할 ×${+p.split.toFixed(2)}</span>` : ''}</td>
           <td><div class="nm" title="${esc(p.name)}">${esc(p.name)}</div></td>
@@ -536,7 +547,7 @@ const FUND_VIEWS = {
           <td class="r">${signed(p.weightDelta, 2, '%p')}</td>
           <td class="r">${usdSigned(p.tradeValue || null)}</td>
           <td class="r">${signed(p.hist?.quarterPricePct)}</td>
-          <td class="r">${p.hist?.breakeven ? fmtMoney(p.hist.breakeven) : '–'}</td>
+          <td class="r">${basisHtml(p.hist)}</td>
           <td class="r">${signed(p.hist?.plPct)}</td>
           <td class="r small">${heldLabel(p.hist) || '–'}</td>
           <td>${spark(p.hist?.weights)}</td>
@@ -553,9 +564,9 @@ const FUND_VIEWS = {
     $('#fq').oninput = () => { clearTimeout(t); t = setTimeout(renderRows, 150); };
     $('#fcsv').onclick = () => downloadCsv(`${d.fund.name}-${d.periodLabel}${fundFilter === 'all' ? '' : '-' + filters[fundFilter][0]}.csv`,
       ['ticker', 'name', 'cusip', 'kind', 'weight_pct', 'value_usd', 'shares', 'action', 'share_change_pct', 'weight_change_pp', 'est_trade_value_usd',
-        'quarter_price_change_pct', 'est_breakeven_usd', 'est_pl_pct', 'held_quarters', 'prev_weight_pct'],
+        'quarter_price_change_pct', 'est_breakeven_usd', 'breakeven_from_quarter', 'est_pl_pct', 'held_quarters', 'prev_weight_pct'],
       shown.map((p) => [p.ticker, p.name, p.cusip, p.kind, r4(p.weight), Math.round(p.value), Math.round(p.shares), p.action, r4(p.changePct), r4(p.weightDelta),
-        Math.round(p.tradeValue), r4(p.hist?.quarterPricePct), r4(p.hist?.breakeven), r4(p.hist?.plPct), p.hist?.heldQuarters, r4(p.prevWeight)]));
+        Math.round(p.tradeValue), r4(p.hist?.quarterPricePct), r4(p.hist?.breakeven), p.hist?.basisFromLabel || '', r4(p.hist?.plPct), p.hist?.heldQuarters, r4(p.prevWeight)]));
     render();
   },
 };
@@ -594,7 +605,7 @@ const openTrack = guard(async (tr, p, d) => {
   const pl = t.breakeven && last ? (last.price / t.breakeven - 1) * 100 : null;
   row.querySelector('.track-side').innerHTML = `
     <div><dt>${esc(last?.label || d.periodLabel)} 분기 말 가격</dt><dd>${last ? fmtMoney(last.price) : '–'}</dd></div>
-    <div><dt>추정 매입가</dt><dd>${t.breakeven ? fmtMoney(t.breakeven) : '–'}</dd></div>
+    <div><dt>추정 매입가${t.basisFromLabel ? ` · ${esc(t.basisFromLabel)}부터` : ''}</dt><dd>${basisHtml(t)}</dd></div>
     <div><dt>추정 손익</dt><dd>${signed(pl)}</dd></div>
     <div><dt>보유</dt><dd>${heldLabel(p.hist) || (p.action === 'exit' ? '이번 분기 청산' : '–')}</dd></div>`;
   const MARK = { new: ['triangle', '--up', '신규'], add: ['triangle', '--up', '확대'], reduce: ['triangle', '--down', '축소'], exit: ['triangle', '--down', '청산'] };

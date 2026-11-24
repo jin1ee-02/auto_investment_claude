@@ -16,6 +16,7 @@ when known, otherwise the CUSIP.
 import datetime as dt
 import json
 import re
+import statistics
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -441,6 +442,159 @@ def store_filing(filing, rows):
                   'positions=excluded.positions,source=excluded.source,source_url=excluded.source_url,fetched_at=CURRENT_TIMESTAMP',
                   (filing.cik, filing.period, filing.accession, filing.form, filing.filed_at,
                    sum(r['value'] for r in rows), len(equity), filing.source, filing.url))
+        _write_history(c, filing.cik, filing.period, filing.accession,
+                       [(r['key'], r['value'], r['shares']) for r in rows if r['kind'] == '' and r['shares'] > 0])
+
+
+# ───────────────────────────── long history (cost basis) ─────────────────────────────
+
+HISTORY_START = '2013-06-30'     # 13F information tables are XML from 2013 Q2; older ones are free text
+
+
+def _write_history(c, cik, period, accession, rows):
+    """Replace one fund-quarter in `history`. rows: [(key, value, shares)]."""
+    c.execute('DELETE FROM history WHERE cik=? AND period=?', (cik, period))
+    c.executemany('INSERT INTO history(key,period,cik,value,shares) VALUES(?,?,?,?,?)',
+                  [(key, period, cik, value, shares) for key, value, shares in rows])
+    c.execute('INSERT INTO history_filings(cik,period,accession) VALUES(?,?,?) '
+              'ON CONFLICT(cik,period) DO UPDATE SET accession=excluded.accession', (cik, period, accession))
+
+
+def sync_history():
+    """Copy recent quarters already in `holdings` into `history` (databases made before it existed)."""
+    with db.tx() as c:
+        c.execute("INSERT OR IGNORE INTO history(key,period,cik,value,shares) "
+                  "SELECT key, period, cik, value, shares FROM holdings WHERE kind='' AND shares>0")
+        c.execute('INSERT OR IGNORE INTO history_filings(cik,period,accession) SELECT cik, period, accession FROM filings')
+
+
+def history_universe():
+    """Securities some tracked fund holds in the recent quarters: the only ones whose past matters."""
+    return {key for (key,) in db.run("SELECT DISTINCT key FROM holdings WHERE kind=''")}
+
+
+def history_rows(rows, known, universe):
+    """Raw 13F rows -> [(key, value, shares)] for share positions in `universe`.
+
+    A CUSIP gets the canonical ticker it already has in `securities`; a CUSIP never seen
+    before falls back to the filing's own ticker (Alphabet kept GOOGL through its CUSIP
+    change). Nothing is written to `securities`, so an old ticker such as FB can never
+    become the canonical key of a security that is still traded today.
+    """
+    merged = {}
+    for r in rows:
+        if r['kind'] != '':
+            continue
+        key = known.get(r['cusip']) or normalize_ticker(r['ticker']) or r['cusip']
+        if key in universe:
+            value, shares = merged.get(key, (0.0, 0.0))
+            merged[key] = (value + r['value'], shares + r['shares'])
+    return [(key, value, shares) for key, (value, shares) in merged.items() if shares > 0]
+
+
+SPLIT_TICKER = re.compile(r'[A-Z]{1,5}(\.[A-Z])?')
+
+
+def split_candidates():
+    """{key: latest quarter} for tickers whose implied price fell under 0.6x or rose over 1.8x in a quarter.
+
+    Those jumps are where a split may hide; ordinary quarters never need a lookup.
+    """
+    prices = {}
+    for key, period, value, shares in db.run('SELECT key, period, value, shares FROM history WHERE value>0 AND shares>0'):
+        prices.setdefault(key, {}).setdefault(period, []).append(value / shares)
+    out = {}
+    for key, by_period in prices.items():
+        if not SPLIT_TICKER.fullmatch(key):
+            continue
+        median = {q: statistics.median(v) for q, v in by_period.items()}
+        for q, price in median.items():
+            before = median.get(previous_period(q))
+            if before and not 0.6 < price / before < 1.8:
+                out[key] = max(out.get(key, ''), q)
+    return out
+
+
+def yahoo_splits(keys):
+    """{key: {quarter end: factor}} from Yahoo Finance; keys Yahoo has no prices for are left out."""
+    import yfinance as yf
+    symbols = {key: re.sub(r'\.([A-Z])$', r'-\1', key) for key in keys}    # BRK.B -> BRK-B
+    wanted = sorted(set(symbols.values()) | {'SPY'})                     # two or more keep the column layout fixed
+    frame = yf.download(wanted, start=HISTORY_START[:4] + '-01-01', interval='3mo', actions=True,
+                        auto_adjust=False, progress=False, threads=True, group_by='column')
+    out = {}
+    for key, symbol in symbols.items():
+        if symbol not in frame['Close'] or frame['Close'][symbol].dropna().empty:
+            continue
+        events = {}
+        for day, factor in frame['Stock Splits'][symbol].items():
+            if factor == factor and factor > 0 and factor != 1:             # NaN-safe
+                quarter = quarter_end(day.date().isoformat())
+                events[quarter] = events.get(quarter, 1.0) * float(factor)
+        out[key] = events
+    return out
+
+
+def check_splits(progress=None, batch=100, pause=8.0):
+    """Look up splits for candidate tickers not yet checked through their latest jump. Returns keys checked.
+
+    Biggest positions go first. Tickers Yahoo has no prices for are recorded in `split_unknown`
+    and not asked again. Yahoo also rate-limits bulk downloads, which looks the same (nothing
+    comes back), so an empty batch is told apart by asking for AAPL alone: if that is empty too,
+    the run stops and the rest waits for the next run (the scheduler retries hourly).
+    """
+    upto = (db.one('SELECT MAX(period) p FROM history') or {}).get('p')
+    if not upto:
+        return 0
+    seen = {r['key']: r['upto'] for r in db.rows('SELECT key, upto FROM split_checks UNION ALL '
+                                                  'SELECT key, upto FROM split_unknown')}
+    size = {k: v for k, v in db.run('SELECT key, MAX(value) FROM history GROUP BY key')}
+    todo = sorted((k for k, q in split_candidates().items() if seen.get(k, '') < q), key=lambda k: -size.get(k, 0))
+    done = 0
+    for i in range(0, len(todo), batch):
+        if progress:
+            progress(i, len(todo))
+        if i:
+            time.sleep(pause)
+        chunk = todo[i:i + batch]
+        found = yahoo_splits(chunk)
+        if not found and not yahoo_splits(['AAPL']):
+            break                                   # rate-limited (or Yahoo is down): try again later
+        with db.tx() as c:
+            c.executemany('INSERT INTO split_unknown(key,upto) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET upto=excluded.upto',
+                          [(key, upto) for key in chunk if key not in found])
+            for key, events in found.items():
+                c.execute('DELETE FROM splits WHERE key=?', (key,))
+                c.executemany('INSERT INTO splits(key,period,factor) VALUES(?,?,?)',
+                              [(key, q, f) for q, f in events.items()])
+                c.execute('INSERT INTO split_checks(key,upto) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET upto=excluded.upto',
+                          (key, upto))
+        done += len(found)
+    return done
+
+
+def backfill_history(cik, universe, known):
+    """Fetch every older quarter of one fund from 13f.info into `history`. Returns quarters added.
+
+    Quarters already on record are skipped, so a second run only asks for the filing list.
+    """
+    cik = str(int(cik))
+    have = {r['period'] for r in db.rows('SELECT period FROM history_filings WHERE cik=?', (cik,))}
+    _name, filings = INFO.list_filings(cik)
+    former = [f for old in funds_seed.PREDECESSORS.get(cik, ()) for f in INFO.list_filings(old)[1]]
+    chosen = {f.period: [f] + additions(filings, f) for f in pick_filings(filings, 999)}
+    for f in pick_filings(former, 999):           # a predecessor filer's quarters, merged as refresh_fund does
+        chosen.setdefault(f.period, []).extend([f] + additions(former, f))
+    added = 0
+    for period in sorted(chosen, reverse=True):
+        if period in have or period < HISTORY_START:
+            continue
+        parts = chosen[period]
+        rows = history_rows([r for p in parts for r in INFO.holdings(p)], known, universe)
+        with db.tx() as c:
+            _write_history(c, cik, period, '+'.join(p.accession for p in parts), rows)
+        added += 1
+    return added
 
 
 def import_snapshot(path):

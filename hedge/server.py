@@ -81,13 +81,65 @@ def _refresh_worker(funds, force):
         db.kv_set('last_refresh', time.time())
         _refresh.update(running=False, current='', finishedAt=dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'),
                         newPeriods=sorted(set(analysis.periods()) - before))
+        start_backfill()
+
+
+# ───────────────────────────── long-history backfill ─────────────────────────────
+# Cost basis needs every quarter since a position was opened, not only the recent ones. Each fund's
+# older 13F tables are fetched once; later quarters arrive through the normal refresh. Then splits
+# are confirmed from market data wherever an implied price jumped (new jumps only, after the first run).
+
+_backfill = {'running': False, 'done': 0, 'total': 0, 'current': '', 'added': 0, 'splitsChecked': 0, 'errors': []}
+_backfill_lock = threading.Lock()
+
+
+def start_backfill():
+    with _backfill_lock:
+        if _backfill['running']:
+            return False
+        funds = [f for f in db.rows('SELECT cik,name FROM funds ORDER BY featured DESC, name')
+                 if not db.kv_get(f"history_done:{f['cik']}")]
+        _backfill.update(running=True, done=0, total=len(funds), current='', added=0, splitsChecked=0, errors=[])
+    threading.Thread(target=_backfill_worker, args=(funds,), name='backfill', daemon=True).start()
+    return True
+
+
+def _backfill_worker(funds):
+    try:
+        universe = sources.history_universe()
+        known = {r['cusip']: r['ticker'] for r in db.rows('SELECT cusip, ticker FROM securities WHERE ticker IS NOT NULL')}
+        for fund in funds:
+            _backfill['current'] = fund['name']
+            try:
+                _backfill['added'] += sources.backfill_history(fund['cik'], universe, known)
+                db.kv_set(f"history_done:{fund['cik']}", True)
+            except Exception as exc:     # retried on the next run; the recent quarters still work meanwhile
+                _backfill['errors'].append({'cik': fund['cik'], 'name': fund['name'], 'error': f'{type(exc).__name__}: {exc}'})
+            _backfill['done'] += 1
+            # Cost bases change with every fund's past (prices are pooled), so the cache is cleared
+            # every few funds rather than after each one: pages stay fast while this runs.
+            if _backfill['done'] % 5 == 0:
+                analysis.invalidate()
+        _backfill['current'] = '주식 분할 확인 (Yahoo Finance)'
+        try:
+            _backfill['splitsChecked'] = sources.check_splits(
+                progress=lambda i, n: _backfill.update(current=f'주식 분할 확인 (Yahoo Finance) {i}/{n}종목'))
+        except Exception as exc:         # market data is a nicety: the 13F rule still covers splits
+            _backfill['errors'].append({'cik': '', 'name': '주식 분할 확인', 'error': f'{type(exc).__name__}: {exc}'})
+    finally:
+        analysis.invalidate()
+        _backfill.update(running=False, current='')
 
 
 def _scheduler():
+    backfill_at = time.time()
     while True:
         last = db.kv_get('last_refresh') or 0
         if time.time() - last > AUTO_REFRESH_HOURS * 3600:
-            start_refresh()
+            start_refresh()                  # ends by starting the backfill
+        elif time.time() - backfill_at > 3600:
+            start_backfill()                 # finishes split lookups a rate limit cut short; quick when nothing is left
+            backfill_at = time.time()
         time.sleep(600)
 
 
@@ -134,6 +186,7 @@ def status():
         'defaultPeriod': analysis.default_period(),
         'source': sources.source_status(),
         'refresh': _refresh,
+        'backfill': _backfill,
         'lastRefresh': db.kv_get('last_refresh'),
         'research': {k: v for k, v in config.research_config().items()},
         'toss': {'configured': config.toss_configured(), 'liveEnabled': config.live_enabled()},
@@ -181,6 +234,7 @@ async def add_fund(request: Request):
         db.run('DELETE FROM funds WHERE cik=? AND last_refresh IS NULL', (cik,))
         raise HTTPException(404, f'13F 공시를 가져오지 못했습니다: {exc}')
     analysis.invalidate()
+    start_backfill()
     return {'cik': cik, 'periods': periods}
 
 
@@ -190,6 +244,9 @@ def remove_fund(cik: str):
         c.execute('DELETE FROM holdings WHERE cik=?', (cik,))
         c.execute('DELETE FROM filings WHERE cik=?', (cik,))
         c.execute('DELETE FROM funds WHERE cik=?', (cik,))
+        c.execute('DELETE FROM history WHERE cik=?', (cik,))
+        c.execute('DELETE FROM history_filings WHERE cik=?', (cik,))
+        c.execute('DELETE FROM kv WHERE key=?', (f'history_done:{cik}',))
     db.kv_set('selection', [c for c in (db.kv_get('selection') or []) if c != cik])
     analysis.invalidate()
     return {'ok': True}
@@ -332,7 +389,9 @@ app.mount('/', StaticFiles(directory=config.WEB, html=True), name='web')
 def main():
     config.load_env()
     funds_seed.ensure_seed()
+    sources.sync_history()
     research.start()
+    start_backfill()
     threading.Thread(target=_scheduler, name='refresh', daemon=True).start()
     port = int(config.env('PORT', '8765'))
     print(f'Hedge Insight → http://127.0.0.1:{port}')
