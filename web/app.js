@@ -821,6 +821,14 @@ async function pageResearch() {
   // Poll while something is queued or running, but never wipe a ticker the user is typing.
   if (active) state.timer = setTimeout(function tick() { if ($('#tickers')?.value) state.timer = setTimeout(tick, 4000); else pageResearch(); }, 4000);
 }
+// Reports write ranges with a single tilde ("1~9월", "25~50%"), and GFM reads a pair of single tildes
+// as strikethrough, crossing out everything in between. Only a double tilde strikes through here.
+marked.use({ tokenizer: { del(src) {
+  const d = /^~~(?=\S)([\s\S]*?\S)~~(?!~)/.exec(src);
+  if (d) return { type: 'del', raw: d[0], text: d[1], tokens: this.lexer.inlineTokens(d[1]) };
+  if (src[0] === '~') return { type: 'text', raw: '~', text: '~' };
+  return false;
+} } });
 const REPORT_TABS = [['final', '최종 판단'], ['trader', '트레이더'], ['plan', '리서치 매니저'], ['market', '시장·기술'], ['fundamentals', '재무'], ['news', '뉴스'], ['sentiment', '소셜 심리'], ['bull', '강세 논거'], ['bear', '약세 논거'], ['riskAggressive', '리스크: 공격'], ['riskConservative', '리스크: 보수'], ['riskNeutral', '리스크: 중립']];
 async function pageReport(id) {
   const j = await api(`/research/${id}`);
