@@ -14,6 +14,7 @@ Values are US dollars. Rows are aggregated per (key, kind) where key is the tick
 when known, otherwise the CUSIP.
 """
 import datetime as dt
+import html as html_lib
 import json
 import re
 import statistics
@@ -193,13 +194,19 @@ class ThirteenFInfo:
 
     def search(self, query):
         _throttles['13f'].wait()
-        r = _client.get(self.base + '/data/autocomplete', params={'q': query}, headers={'User-Agent': APP_UA})
+        r = _client.get(self.base + '/search/autocomplete', params={'q': query}, headers={'User-Agent': APP_UA})
         r.raise_for_status()
+        return self.parse_search(r.text)
+
+    @staticmethod
+    def parse_search(html):
+        """Managers from the site's search box, which answers with an HTML list (managers, then investments)."""
+        managers = html.split('>Investments<', 1)[0]
         out = []
-        for m in r.json().get('managers', []):
-            cik = re.search(r'/manager/(\d{10})', m.get('url', ''))
-            if cik:
-                out.append({'cik': str(int(cik.group(1))), 'name': m.get('name', ''), 'location': m.get('extra', '')})
+        for cik, body in re.findall(r'<a href="/manager/(\d{10})[^"]*">(.*?)</a>', managers, re.S):
+            text = [html_lib.unescape(re.sub(r'\s+', ' ', t).strip()) for t in re.findall(r'<div[^>]*>([^<]*)', body)]
+            text = [t for t in text if t]
+            out.append({'cik': str(int(cik)), 'name': text[0] if text else '', 'location': text[1] if len(text) > 1 else ''})
         return out
 
 

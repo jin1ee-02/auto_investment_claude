@@ -90,6 +90,20 @@ class SourcesTest(Base):
         self.assertEqual([f.accession for f in chosen], [a, b])
         self.assertEqual([f.accession for f in sources.additions(filings, chosen[1])], [c])
 
+    def test_13finfo_search_lists_managers_only(self):
+        html = '''<div class="font-medium text-xl pt-2 px-3">Managers</div>
+            <a href="/manager/0000921669-icahn-carl-c"><div class="px-3 py-1">
+              <div class="text-xl leading-6">
+                ICAHN CARL C (Carl Icahn)
+              </div>
+              <div class="text-base leading-4">
+                Sunny Isles Beach, FL
+              </div></div></a>
+          <div class="font-medium text-xl pt-2 px-3">Investments</div>
+            <a href="/cusip/451100101"><div><div>IEP - Icahn Enterprises</div></div></a>'''
+        self.assertEqual(sources.ThirteenFInfo.parse_search(html),
+                         [{'cik': '921669', 'name': 'ICAHN CARL C (Carl Icahn)', 'location': 'Sunny Isles Beach, FL'}])
+
     def test_canonical_ticker_is_stable_across_sources(self):
         row = {'cusip': 'X1', 'name': 'A', 'cls': '', 'kind': '', 'value': 1.0, 'shares': 1.0}
         first = sources.finalize([dict(row, ticker='ABC')], 0)
