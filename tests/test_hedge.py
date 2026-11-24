@@ -28,7 +28,8 @@ def put(cik, period, rows, name=None):
 
 class Base(unittest.TestCase):
     def setUp(self):
-        for table in ('funds', 'filings', 'holdings', 'securities', 'research', 'orders', 'paper_positions', 'kv'):
+        for table in ('funds', 'filings', 'holdings', 'securities', 'research', 'orders', 'paper_positions', 'kv',
+                      'history', 'history_filings', 'splits', 'split_checks', 'split_unknown'):
             db.run(f'DELETE FROM {table}')
         analysis.invalidate()
 
@@ -222,6 +223,84 @@ class AnalysisTest(Base):
         self.assertAlmostEqual(h['BBB']['sincePct'], 50.0)
         self.assertAlmostEqual(h['BBB']['quarterPricePct'], 25.0)
         self.assertEqual(len(h['BBB']['weights']), 4)
+
+    def test_cost_basis_uses_full_history_with_splits(self):
+        def older(cik, period, rows):           # what backfill_history stores for quarters before `holdings`
+            with db.tx() as c:
+                sources._write_history(c, cik, period, 'old', [(k, float(v), float(s)) for k, s, v in rows])
+        q0, q3, q4 = '2025-06-30', '2025-09-30', '2025-12-31'
+        older('1', q0, [('AAA', 100, 1000)])                              # bought at 10, before the recent window
+        older('1', q3, [('AAA', 100, 1200)])
+        older('2', q3, [('AAA', 50, 600)])
+        older('1', q4, [('AAA', 200, 1400)])                              # 2:1 split, seen by both holders
+        older('2', q4, [('AAA', 100, 700)])
+        put('1', Q1, [('AAA', 300, 2400)])                                # +100 post-split shares at 8
+        put('1', Q2, [('AAA', 300, 2700)])
+        h = analysis.position_history('1', Q2)['positions']['AAA']
+        self.assertAlmostEqual(h['breakeven'], (200 * 5 + 100 * 8) / 300)  # 100 @10 is 200 @5 after the split
+        self.assertAlmostEqual(h['plPct'], (9 / 6 - 1) * 100)
+        self.assertEqual(h['heldQuarters'], 5)
+        self.assertAlmostEqual(h['sincePct'], (9 / 5 - 1) * 100)
+        self.assertEqual(h['basisFrom'], q0)                              # open since the first quarter on record
+        self.assertEqual(h['basisFromLabel'], '2025 Q2')
+        t = analysis.position_track('1', 'AAA', Q2)
+        self.assertAlmostEqual(t['breakeven'], h['breakeven'])
+        self.assertEqual(t['basisFromLabel'], '2025 Q2')
+        older('1', '2025-03-31', [])                                      # an earlier quarter without AAA
+        analysis.invalidate()
+        h = analysis.position_history('1', Q2)['positions']['AAA']
+        self.assertIsNone(h['basisFrom'])                                 # the purchase itself is on record
+        self.assertFalse(h['heldSinceStart'])
+        self.assertAlmostEqual(h['breakeven'], 6.0)
+
+    def test_market_data_splits_override_the_13f_rule(self):
+        put('1', Q1, [('AAA', 100, 10000), ('BBB', 100, 1000)])
+        put('2', Q1, [('AAA', 50, 5000)])
+        put('1', Q2, [('AAA', 1000, 9000), ('BBB', 200, 2400)])        # AAA 10:1, but holders traded around it
+        put('2', Q2, [('AAA', 700, 6300)])
+        self.assertEqual(analysis.market(Q1, Q2)[1], {})                # ratios 10 and 14: the 13F rule cannot tell
+        db.run("INSERT INTO split_checks(key, upto) VALUES('AAA', ?), ('BBB', ?)", (Q2, Q2))
+        db.run("INSERT INTO splits(key, period, factor) VALUES('AAA', ?, 10)", (Q2,))
+        analysis.invalidate()
+        self.assertEqual(analysis.market(Q1, Q2)[1], {'AAA': 10})       # BBB checked too: doubled, no split
+        diff = {p['key']: p for p in analysis.fund_diff('1', Q2)['positions']}
+        self.assertEqual(diff['AAA']['action'], 'hold')                 # 100 -> 1000 is the split, not a purchase
+        self.assertEqual(diff['BBB']['action'], 'add')
+        self.assertAlmostEqual(analysis.position_history('1', Q2)['positions']['AAA']['breakeven'], 10.0)
+
+    def test_split_candidates_only_flag_price_jumps(self):
+        put('1', Q1, [('AAA', 100, 10000), ('BBB', 100, 1000), ('C1234567', 10, 100)])
+        put('1', Q2, [('AAA', 400, 11000), ('BBB', 100, 1100), ('C1234567', 40, 110)])
+        self.assertEqual(sources.split_candidates(), {'AAA': Q2})      # CUSIP keys are never looked up
+
+    def test_history_rows_keep_canonical_keys(self):
+        rows = [{'ticker': 'FB', 'cusip': '30303M102', 'kind': '', 'value': 100.0, 'shares': 2.0},
+                {'ticker': 'GOOGL', 'cusip': 'OLDCUSIP1', 'kind': '', 'value': 50.0, 'shares': 1.0},
+                {'ticker': 'GOOGL', 'cusip': '02079K305', 'kind': '', 'value': 50.0, 'shares': 1.0},
+                {'ticker': 'META', 'cusip': '30303M102', 'kind': 'CALL', 'value': 9.0, 'shares': 9.0},
+                {'ticker': 'ZZZ', 'cusip': 'ZZZCUSIP1', 'kind': '', 'value': 5.0, 'shares': 5.0}]
+        known = {'30303M102': 'META', '02079K305': 'GOOGL'}
+        got = sorted(sources.history_rows(rows, known, {'META', 'GOOGL'}))
+        self.assertEqual(got, [('GOOGL', 100.0, 2.0), ('META', 100.0, 2.0)])   # old ticker FB lands on META
+
+    def test_split_factor(self):
+        self.assertEqual(analysis.split_factor([2.0, 2.0, 2.01], 0.52), 2)
+        self.assertIsNone(analysis.split_factor([2.0], 0.5))                    # one holder is not enough
+        self.assertIsNone(analysis.split_factor([2.0, 2.0], 1.0))               # value doubled: a real purchase
+        self.assertIsNone(analysis.split_factor([1.3, 1.5], 0.9))
+        # Real splits where holders also traded (13F share ratios across tracked funds):
+        self.assertEqual(analysis.split_factor([0.794, 2.219, 3.852, 4.163], 115.81 / 364.8), 4)       # AAPL 2020
+        self.assertEqual(analysis.split_factor([19.06, 20.0, 20.02, 20.131, 20.783, 29.792, 41.251, 49.548, 89.443],
+                                               95.65 / 2179.26), 20)                                   # GOOGL 2022
+        self.assertEqual(analysis.split_factor([1.217, 1.561, 2.069, 5.93, 6.249, 8.379, 9.305, 9.525, 9.76, 9.93,
+                                                10.0, 12.752], 123.54 / 903.56), 10)                   # NVDA 2024
+        self.assertIsNone(analysis.split_factor([1.5, 1.52, 1.0], 0.95))       # two funds adding half: not a split
+        self.assertIsNone(analysis.split_factor([2.0, 2.05, 1.0, 1.0, 1.0], 0.7))   # a crash, most holders unchanged
+        # Trading that only looks like a split (seen in the tracked funds' recent 13Fs):
+        self.assertIsNone(analysis.split_factor([0.714, 1.503, 1.51], 0.971))       # KMI: price flat, so no 3:2
+        self.assertIsNone(analysis.split_factor([0.516, 0.517, 1.616, 1.693, 2.851], 1.235))   # DFS: halving in a rally
+        self.assertIsNone(analysis.split_factor([0.328, 0.331, 1.172], 2.114))      # RUN: two funds cut by two thirds
+        self.assertEqual(analysis.split_factor([2.0, 2.0, 2.0], 0.52), 2)          # an exact 2:1 still counts
 
     def test_cost_basis(self):
         self.assertAlmostEqual(analysis.cost_basis([(100, 10), (200, 20)]), 15.0)     # bought 100 @10, 100 @20

@@ -34,6 +34,20 @@ CREATE TABLE IF NOT EXISTS orders(
   status TEXT NOT NULL, client_order_id TEXT, broker_order_id TEXT, research_id INTEGER, rating TEXT, note TEXT);
 CREATE TABLE IF NOT EXISTS paper_positions(symbol TEXT PRIMARY KEY, quantity INTEGER NOT NULL, avg_price REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+-- Every 13F quarter on record for each fund (back to its first filing on 13f.info), share positions only.
+-- Used for cost basis and holding periods, which need more than the recent quarters in `holdings`.
+-- Only securities some tracked fund holds in `holdings` are kept, so the table stays small.
+CREATE TABLE IF NOT EXISTS history_filings(cik TEXT NOT NULL, period TEXT NOT NULL, accession TEXT, PRIMARY KEY(cik, period));
+CREATE TABLE IF NOT EXISTS history(
+  key TEXT NOT NULL, period TEXT NOT NULL, cik TEXT NOT NULL, value REAL NOT NULL, shares REAL NOT NULL,
+  PRIMARY KEY(key, period, cik)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS history_cik ON history(cik, period);
+-- Stock splits confirmed from market data (Yahoo Finance), by quarter: factor = new shares per old.
+-- split_checks says up to which quarter a key was looked up; there, "no row" means "no split".
+CREATE TABLE IF NOT EXISTS splits(key TEXT NOT NULL, period TEXT NOT NULL, factor REAL NOT NULL, PRIMARY KEY(key, period));
+CREATE TABLE IF NOT EXISTS split_checks(key TEXT PRIMARY KEY, upto TEXT NOT NULL);
+-- Tickers Yahoo had no prices for (delisted, renamed): not asked again, left to the 13F split rule.
+CREATE TABLE IF NOT EXISTS split_unknown(key TEXT PRIMARY KEY, upto TEXT NOT NULL);
 '''
 
 _local = threading.local()

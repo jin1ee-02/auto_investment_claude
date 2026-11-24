@@ -9,6 +9,7 @@ between two snapshots. Three things keep that difference honest:
 * options       - PUT/CALL rows are shown per fund but never count as buying or selling.
 """
 import functools
+import math
 import statistics
 import threading
 
@@ -72,7 +73,67 @@ def change_action(prev_shares, shares, min_change):
     return ('add' if change >= threshold else 'reduce' if change <= -threshold else 'hold'), change
 
 
-@versioned(maxsize=32)
+def split_factor(ratios, price_ratio, min_hits=2):
+    """The stock split behind a quarter's share changes, or None.
+
+    ratios: each continuing holder's shares now / shares a quarter ago; price_ratio: the implied
+    price now / a quarter ago. A split leaves value roughly where it was, so dividing the price
+    move by the factor must leave an ordinary quarterly move, and a smaller one than without it.
+    """
+    if len(ratios) < min_hits:
+        return None
+
+    def explains_price(f):
+        return 0.6 <= price_ratio * f <= 1.6 and abs(math.log(price_ratio * f)) < abs(math.log(price_ratio))
+
+    # Most continuing holders show exactly the factor. Two thirds of holders on it puts the
+    # median on it too, so only factors next to the median need the full count.
+    mid = statistics.median(ratios)
+    for f in SPLIT_FACTORS:
+        if abs(mid / f - 1) >= 0.01:
+            continue
+        hits = sum(1 for ratio in ratios if abs(ratio / f - 1) < 0.01)
+        if hits >= min_hits and hits >= len(ratios) * 2 / 3 and explains_price(f):
+            return f
+    # Active funds trade around a split, so often only some holders show the factor, and only
+    # roughly (AAPL 4:1 in 2020: 3.85 and 4.16 next to 0.79 and 2.22). For a forward split of 3 or
+    # more the price must also have fallen by more than half, which trading noise does not do, so a
+    # looser match is safe there: a third of holders within 5% of the factor, and more of them
+    # than holders who kept their shares. Halving or doubling is left to the exact rule above:
+    # among small caps with a few holders, trims of half during a rally look just like a 1:2.
+    unchanged = sum(1 for ratio in ratios if abs(ratio - 1) < 0.05)
+    best, best_hits = None, 0
+    for f in SPLIT_FACTORS:
+        if f < 3 or not explains_price(f):
+            continue
+        hits = sum(1 for ratio in ratios if abs(ratio / f - 1) < 0.05)
+        if hits >= min_hits and hits * 3 >= len(ratios) and hits > unchanged and hits > best_hits:
+            best, best_hits = f, hits
+    return best
+
+
+@versioned(maxsize=1)
+def known_splits():
+    """Splits confirmed from market data: {key: (checked up to quarter, {quarter: factor})}."""
+    out = {r['key']: (r['upto'], {}) for r in db.rows('SELECT key, upto FROM split_checks')}
+    for r in db.rows('SELECT key, period, factor FROM splits'):
+        out.setdefault(r['key'], ('', {}))[1][r['period']] = r['factor']
+    return out
+
+
+def quarter_split(key, period, ratios, price_ratio):
+    """Split factor of `key` in the quarter ending `period`, or None.
+
+    Market data decides wherever the key was looked up; the 13F rule (`split_factor`) covers
+    the rest: CUSIP-only securities, tickers Yahoo does not know, and quarters after the lookup.
+    """
+    upto, events = known_splits().get(key, ('', {}))
+    if period <= upto:
+        return events.get(period)
+    return split_factor(ratios, price_ratio)
+
+
+@versioned(maxsize=64)
 def market(prev, cur):
     """Implied quarter-end prices and split factors, pooled over every stored fund."""
     data = {}
@@ -88,21 +149,9 @@ def market(prev, cur):
         if prev not in by_period or cur not in by_period:
             continue
         both = [by_period[cur][c][1] / by_period[prev][c][1] for c in by_period[cur] if c in by_period[prev]]
-        if len(both) < 2:
-            continue
-        price_ratio = p[cur] / p[prev]
-        # Two thirds of holders sitting on the factor puts the median on it too, so only
-        # factors next to the median can qualify; that skips the scan for almost every key.
-        mid = statistics.median(both)
-        for f in SPLIT_FACTORS:
-            if abs(mid / f - 1) >= 0.01:
-                continue
-            hits = sum(1 for ratio in both if abs(ratio / f - 1) < 0.01)
-            # A split keeps value roughly constant: the split-adjusted price move must be an
-            # ordinary quarterly move, and most continuing holders must show exactly the factor.
-            if hits >= 2 and hits >= len(both) * 2 / 3 and 0.6 <= price_ratio * f <= 1.6:
-                splits[key] = f
-                break
+        f = quarter_split(key, cur, both, p[cur] / p[prev])
+        if f:
+            splits[key] = f
     return prices, splits
 
 
@@ -299,19 +348,74 @@ def cost_basis(steps):
     return None if unknown or held <= 0 else cost / held
 
 
+@versioned(maxsize=64)
+def long_positions(cik, period):
+    """Holding period and estimated cost of each share position `cik` holds at `period`, over its whole 13F record.
+
+    Reads `history`, which goes back to the fund's first 13F on 13f.info, so a position bought
+    years before the recent quarters gets its real entry price rather than the first recent one.
+    Prices are quarter-end prices implied by every tracked fund's value / shares, and splits come
+    from `quarter_split` as in `market`: market data where it was looked up, else the 13F rule.
+
+    Per key: heldQuarters, firstPeriod, heldSinceStart, sincePct, breakeven, basisFrom.
+    basisFrom is set when the position was already open in the fund's first quarter on record:
+    the cost then counts everything held at that point as bought at that quarter's price.
+    """
+    filed = [q for (q,) in db.run('SELECT period FROM history_filings WHERE cik=? AND period<=? ORDER BY period',
+                                  (cik, period))]
+    if not filed:
+        return {}
+    data = {}
+    for key, q, holder, value, shares in db.run(
+            'SELECT h.key, h.period, h.cik, h.value, h.shares FROM holdings c JOIN history h ON h.key = c.key '
+            "WHERE c.cik=? AND c.period=? AND c.kind='' AND c.shares>0 AND h.period<=? AND h.value>0 AND h.shares>0",
+            (cik, period, period)):
+        data.setdefault(key, {}).setdefault(q, {})[holder] = (value, shares)
+    return {key: _long_position(key, cik, period, filed, by_period) for key, by_period in data.items()
+            if cik in by_period.get(period, {})}
+
+
+def _long_position(key, cik, period, filed, by_period):
+    quarters = sorted(by_period)
+    raw = {q: statistics.median(v / s for v, s in holders.values()) for q, holders in by_period.items()}
+    # Carry every quarter onto `period`'s share basis: divide by each split that came after it.
+    adj, factor = {}, 1.0
+    for q in reversed(quarters):
+        adj[q] = factor
+        prev = previous_period(q)
+        if prev in by_period:
+            both = [by_period[q][c][1] / by_period[prev][c][1] for c in by_period[q] if c in by_period[prev]]
+            factor *= quarter_split(key, q, both, raw[q] / raw[prev]) or 1
+    price = {q: raw[q] / adj[q] for q in quarters}
+    mine = {q: holders[cik][1] * adj[q] for q, holders in by_period.items() if cik in holders}
+    streak, q = [], period
+    while mine.get(q):
+        streak.append(q)
+        q = previous_period(q)
+    first = streak[-1]
+    since_start = first == filed[0]
+    return {'heldQuarters': len(streak), 'firstPeriod': first, 'heldSinceStart': since_start,
+            'sincePct': (price[period] / price[first] - 1) * 100 if len(streak) > 1 else None,
+            'breakeven': cost_basis([(mine.get(q, 0), price.get(q)) for q in filed]),
+            'basisFrom': first if since_start else None}
+
+
 @versioned(maxsize=128)
 def position_history(cik, period):
     """For each share position held at `period`: how long it has been held and how its price moved.
 
     heldQuarters counts consecutive quarters back from `period`; `heldSinceStart` means the
-    streak reaches the oldest stored filing, so the real holding period may be longer.
+    streak reaches the oldest filing on record, so the real holding period may be longer.
     sincePct is the split-adjusted price change since the first quarter of that streak.
     breakeven is the estimated average cost (quarter-end prices) and plPct the gain on it at `period`.
+    Holding period, sincePct and breakeven come from the full 13F record (`long_positions`);
+    the recent quarters in `holdings` are only the fallback.
     """
     fund_periods = [r['period'] for r in db.rows('SELECT period FROM filings WHERE cik=? AND period<=? ORDER BY period',
                                                  (cik, period))]
     quarters = [q for q in reversed(periods()) if q <= period]
     totals = {r['period']: r['total_value'] or 1 for r in db.rows('SELECT period, total_value FROM filings WHERE cik=?', (cik,))}
+    long = long_positions(cik, period)
     weights, shares = {}, {}
     for r in db.rows("SELECT period, key, value, shares FROM holdings WHERE cik=? AND kind='' AND period<=?", (cik, period)):
         weights.setdefault(r['key'], {})[r['period']] = r['value'] / totals[r['period']] * 100
@@ -339,9 +443,14 @@ def position_history(cik, period):
         out[key] = {'heldQuarters': len(streak), 'firstPeriod': first, 'heldSinceStart': first == fund_periods[0],
                     'sincePct': (ratio - 1) * 100 if ratio is not None and len(streak) > 1 else None,
                     'quarterPricePct': (quarter - 1) * 100 if quarter else None,
-                    'price': now, 'breakeven': cost,
-                    'plPct': (now / cost - 1) * 100 if cost and now else None,
+                    'price': now, 'breakeven': cost, 'basisFrom': fund_periods[0] if first == fund_periods[0] else None,
                     'weights': [round(w.get(q, 0), 3) for q in fund_periods]}
+        # The full 13F record, when there is one, replaces the recent-quarters estimate.
+        out[key].update(long.get(key) or {})
+        cost = out[key]['breakeven']
+        out[key]['plPct'] = (now / cost - 1) * 100 if cost and now else None
+        if out[key]['basisFrom']:
+            out[key]['basisFromLabel'] = period_label(out[key]['basisFrom'])
     return {'periods': fund_periods, 'positions': out}
 
 
@@ -370,7 +479,11 @@ def position_track(cik, key, period):
             prev = sh
         rows.append({'period': q, 'label': period_label(q), 'price': price[q], 'shares': sh,
                      'value': sh * price[q] if sh and price[q] else None, 'action': action, 'filed': q in filed})
-    return {'key': key, 'rows': rows, 'breakeven': cost_basis(steps)}
+    long = long_positions(cik, period).get(key)
+    if long:
+        return {'key': key, 'rows': rows, 'breakeven': long['breakeven'],
+                'basisFromLabel': period_label(long['basisFrom']) if long['basisFrom'] else None}
+    return {'key': key, 'rows': rows, 'breakeven': cost_basis(steps), 'basisFromLabel': None}
 
 
 def track_record(cik, period):
