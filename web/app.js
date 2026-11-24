@@ -5,7 +5,8 @@ const state = { status: null, period: null, selection: [], charts: [], timer: nu
 
 // ───────────── helpers ─────────────
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const tokens = new Map();
+const css = (name) => tokens.get(name) ?? tokens.set(name, getComputedStyle(document.documentElement).getPropertyValue(name).trim()).get(name);
 const fmtUsd = (v) => {
   if (v == null) return '–';
   const a = Math.abs(v), s = v < 0 ? '-' : '';
@@ -256,17 +257,19 @@ const FUND_TABS = [['top', '상위 보유'], ['trades', '대규모 매매'], ['s
 let fundFilter = 'all', fundTab = 'top', fundCik = null, treeColor = 'change';
 const tip = (extra = {}) => ({ backgroundColor: css('--surface'), borderColor: css('--line'), textStyle: { color: css('--text'), fontSize: 12 }, ...extra });
 const axis = (extra = {}) => ({ axisLine: { lineStyle: { color: css('--line-strong') } }, axisTick: { show: false }, axisLabel: { color: css('--text-2'), fontSize: 11 }, splitLine: { lineStyle: { color: css('--line') } }, ...extra });
+// Value axis whose labels use `formatter` ('{value}%', fmtUsd …); every chart shares the same look.
+const valueAxis = (formatter, extra = {}) => ({ type: 'value', ...axis(), axisLabel: { color: css('--text-2'), fontSize: 11, formatter }, ...extra });
+const legend = (extra = {}) => ({ top: 4, right: 12, textStyle: { color: css('--text-2'), fontSize: 11 }, itemWidth: 10, itemHeight: 10, ...extra });
+const heldLabel = (h) => h?.heldQuarters ? `${h.heldQuarters}${h.heldSinceStart ? '+' : ''}분기` : null;
 const arrow = (v, d = 1) => v == null ? '' : `${v >= 0 ? '▲' : '▼'}${Math.abs(v).toFixed(d)}%`;
 const usdSigned = (v) => v == null ? '–' : `<span class="${v > 0 ? 'pos' : v < 0 ? 'neg' : ''}">${v > 0 ? '+' : ''}${fmtUsd(v)}</span>`;
 const NO_PREV = '<div class="card empty">직전 분기 공시가 없어 이번 분기 매매를 계산할 수 없습니다.</div>';
 
-// Quarters chained up to the period on screen, so the strip agrees with the chosen quarter.
+// The chain up to the period on screen (the API keeps it per quarter), so the strip agrees with the chosen quarter.
 function chainTo(d) {
-  const qs = d.history.quarters.filter((q) => q.period <= d.period && q.returnPct != null && q.benchPct != null);
-  const last = qs.at(-1), n = qs.length;
-  return { n, cum: last?.cumPct ?? null, bench: last?.benchCumPct ?? null,
-    annual: n >= 4 ? ((1 + last.cumPct / 100) ** (4 / n) - 1) * 100 : null,
-    benchAnnual: n >= 4 ? ((1 + last.benchCumPct / 100) ** (4 / n) - 1) * 100 : null };
+  const last = d.history.quarters.filter((q) => q.period <= d.period && q.chained).at(-1);
+  return { n: last?.chained ?? 0, cum: last?.cumPct ?? null, bench: last?.benchCumPct ?? null,
+    annual: last?.annualPct ?? null, benchAnnual: last?.benchAnnualPct ?? null };
 }
 
 async function pageFund(cik, tab, period) {
@@ -372,7 +375,7 @@ const FUND_VIEWS = {
     chart($('#tradebar'), {
       grid: { left: 96, right: 72, top: 16, bottom: 28 },
       tooltip: tip({ trigger: 'axis', axisPointer: { type: 'shadow' }, formatter: ([x]) => { const p = rows[x.dataIndex]; return `<b>${esc(p.ticker || p.cusip)}</b> · ${esc(p.name)}<br>${ACTION[p.action]}${p.action === 'new' || p.changePct == null ? '' : ` ${p.changePct > 0 ? '+' : ''}${p.changePct.toFixed(1)}% (주식 수)`} · 추정 ${fmtUsd(p.tradeValue)}`; } }),
-      xAxis: { type: 'value', ...axis(), axisLabel: { color: css('--text-2'), fontSize: 11, formatter: fmtUsd } },
+      xAxis: valueAxis(fmtUsd),
       yAxis: { type: 'category', data: rows.map((p) => `${p.ticker || p.cusip} ${ACTION[p.action]}`), ...axis({ splitLine: { show: false } }) },
       series: [{ type: 'bar', barMaxWidth: 16, data: rows.map((p) => ({ value: p.tradeValue, itemStyle: { color: css(p.tradeValue > 0 ? '--up' : '--down'), borderRadius: 2 } })),
         label: { show: true, position: 'outside', color: css('--text-2'), fontSize: 11, formatter: ({ value }) => fmtUsd(value) } }],
@@ -407,7 +410,7 @@ const FUND_VIEWS = {
       grid: { left: 48, right: 24, top: 28, bottom: 36 },
       tooltip: tip({ trigger: 'axis', formatter: ([x]) => `상위 ${x.dataIndex + 1}개 · ${x.value.toFixed(1)}%<br>${esc(sh[x.dataIndex].ticker || sh[x.dataIndex].name)} ${sh[x.dataIndex].weight.toFixed(2)}%` }),
       xAxis: { type: 'category', data: cum.map((_, i) => i + 1), boundaryGap: false, ...axis({ splitLine: { show: false } }) },
-      yAxis: { type: 'value', max: 100, ...axis(), axisLabel: { color: css('--text-2'), fontSize: 11, formatter: '{value}%' } },
+      yAxis: valueAxis('{value}%', { max: 100 }),
       series: [{ type: 'line', data: cum.map((v) => +v.toFixed(2)), symbol: 'none', lineStyle: { color: css('--mark'), width: 2 },
         areaStyle: { color: css('--mark'), opacity: 0.12 },
         markPoint: { symbol: 'circle', symbolSize: 7, itemStyle: { color: css('--mark') },
@@ -439,10 +442,10 @@ const FUND_VIEWS = {
       S&amp;P 500 은 추적 중인 펀드들이 보고한 SPY(없으면 IVV·VOO)의 분기 말 가격으로 계산한 가격 수익률입니다. 반영 비율은 가격을 알 수 있었던 보유분의 비중입니다.</p>`;
     const rated = qs.filter((q) => q.returnPct != null);
     chart($('#qret'), {
-      grid: { left: 52, right: 16, top: 36, bottom: 36 }, legend: { top: 4, right: 12, textStyle: { color: css('--text-2'), fontSize: 11 }, itemWidth: 10, itemHeight: 10 },
+      grid: { left: 52, right: 16, top: 36, bottom: 36 }, legend: legend(),
       tooltip: tip({ trigger: 'axis', axisPointer: { type: 'shadow' }, valueFormatter: (v) => v == null ? '–' : `${v > 0 ? '+' : ''}${v.toFixed(1)}%` }),
       xAxis: { type: 'category', data: rated.map((q) => q.label), ...axis({ splitLine: { show: false } }) },
-      yAxis: { type: 'value', ...axis(), axisLabel: { color: css('--text-2'), fontSize: 11, formatter: '{value}%' } },
+      yAxis: valueAxis('{value}%'),
       series: [
         { name: d.fund.name, type: 'bar', barMaxWidth: 28, data: rated.map((q) => +q.returnPct.toFixed(2)), itemStyle: { color: css('--mark'), borderRadius: 2 } },
         { name: 'S&P 500', type: 'bar', barMaxWidth: 28, data: rated.map((q) => q.benchPct == null ? null : +q.benchPct.toFixed(2)), itemStyle: { color: css('--text-3'), borderRadius: 2 } },
@@ -452,10 +455,10 @@ const FUND_VIEWS = {
     const start = qs[qs.indexOf(linked[0]) - 1]?.label || '시작';
     const line = (name, key, color) => ({ name, type: 'line', data: [0, ...linked.map((q) => +q[key].toFixed(2))], symbolSize: 6, lineStyle: { color, width: 2 }, itemStyle: { color } });
     chart($('#cum'), {
-      grid: { left: 52, right: 36, top: 36, bottom: 36 }, legend: { top: 4, right: 12, textStyle: { color: css('--text-2'), fontSize: 11 }, itemWidth: 14, itemHeight: 3 },
+      grid: { left: 52, right: 36, top: 36, bottom: 36 }, legend: legend({ itemWidth: 14, itemHeight: 3 }),
       tooltip: tip({ trigger: 'axis', valueFormatter: (v) => `${v > 0 ? '+' : ''}${v.toFixed(1)}%` }),
       xAxis: { type: 'category', data: [start, ...linked.map((q) => q.label)], boundaryGap: false, ...axis({ splitLine: { show: false } }) },
-      yAxis: { type: 'value', ...axis(), axisLabel: { color: css('--text-2'), fontSize: 11, formatter: '{value}%' } },
+      yAxis: valueAxis('{value}%'),
       series: [line(d.fund.name, 'cumPct', css('--mark')), line('S&P 500', 'benchCumPct', css('--text-3'))],
     });
   },
@@ -474,9 +477,9 @@ const FUND_VIEWS = {
     chart($('#aumbar'), {
       grid: { left: 64, right: 48, top: 36, bottom: 36 },
       tooltip: tip({ trigger: 'axis', formatter: (ps) => `${ps[0].name}<br>${ps.map((x) => `${x.marker}${x.seriesName} ${x.seriesIndex ? fmtNum(x.value) : fmtUsd(x.value)}`).join('<br>')}` }),
-      legend: { top: 4, right: 12, textStyle: { color: css('--text-2'), fontSize: 11 }, itemWidth: 10, itemHeight: 10 },
+      legend: legend(),
       xAxis: { type: 'category', data: qs.map((q) => q.label), ...axis({ splitLine: { show: false } }) },
-      yAxis: [{ type: 'value', ...axis(), axisLabel: { color: css('--text-2'), fontSize: 11, formatter: fmtUsd } },
+      yAxis: [valueAxis(fmtUsd),
         { type: 'value', ...axis({ splitLine: { show: false } }), axisLabel: { color: css('--text-3'), fontSize: 11 } }],
       series: [
         { name: '13F 평가액', type: 'bar', barMaxWidth: 36, data: qs.map((q) => q.totalValue), itemStyle: { color: css('--mark'), borderRadius: [3, 3, 0, 0] } },
@@ -488,9 +491,9 @@ const FUND_VIEWS = {
     chart($('#aumsplit'), {
       grid: { left: 64, right: 16, top: 36, bottom: 36 },
       tooltip: tip({ trigger: 'axis', axisPointer: { type: 'shadow' }, valueFormatter: (v) => `${v > 0 ? '+' : ''}${fmtUsd(v)}` }),
-      legend: { top: 4, right: 12, textStyle: { color: css('--text-2'), fontSize: 11 }, itemWidth: 10, itemHeight: 10 },
+      legend: legend(),
       xAxis: { type: 'category', data: split.map((q) => q.label), ...axis({ splitLine: { show: false } }) },
-      yAxis: { type: 'value', ...axis(), axisLabel: { color: css('--text-2'), fontSize: 11, formatter: fmtUsd } },
+      yAxis: valueAxis(fmtUsd),
       series: [
         { name: '가격 효과', type: 'bar', stack: 'chg', barMaxWidth: 36, data: split.map((q) => q.priceEffect), itemStyle: { color: css('--s2') } },
         { name: '순매매·기타', type: 'bar', stack: 'chg', barMaxWidth: 36, data: split.map((q) => q.netFlow), itemStyle: { color: css('--s3') } },
@@ -535,7 +538,7 @@ const FUND_VIEWS = {
           <td class="r">${signed(p.hist?.quarterPricePct)}</td>
           <td class="r">${p.hist?.breakeven ? fmtMoney(p.hist.breakeven) : '–'}</td>
           <td class="r">${signed(p.hist?.plPct)}</td>
-          <td class="r small">${p.hist?.heldQuarters ? `${p.hist.heldQuarters}${p.hist.heldSinceStart ? '+' : ''}분기` : '–'}</td>
+          <td class="r small">${heldLabel(p.hist) || '–'}</td>
           <td>${spark(p.hist?.weights)}</td>
           <td>${ratingTag(p.research)}</td></tr>`).join('') || `<tr><td colspan="15" class="empty">해당 내역이 없습니다</td></tr>`}</tbody>`;
       $('#ftable').querySelectorAll('tr.click').forEach((tr) => tr.onclick = (e) => { if (!e.target.closest('a,button,input')) openTrack(tr, shown[+tr.dataset.i], d); });
@@ -593,15 +596,15 @@ const openTrack = guard(async (tr, p, d) => {
     <div><dt>${esc(last?.label || d.periodLabel)} 분기 말 가격</dt><dd>${last ? fmtMoney(last.price) : '–'}</dd></div>
     <div><dt>추정 매입가</dt><dd>${t.breakeven ? fmtMoney(t.breakeven) : '–'}</dd></div>
     <div><dt>추정 손익</dt><dd>${signed(pl)}</dd></div>
-    <div><dt>보유</dt><dd>${p.hist?.heldQuarters ? `${p.hist.heldQuarters}${p.hist.heldSinceStart ? '+' : ''}분기` : p.action === 'exit' ? '이번 분기 청산' : '–'}</dd></div>`;
+    <div><dt>보유</dt><dd>${heldLabel(p.hist) || (p.action === 'exit' ? '이번 분기 청산' : '–')}</dd></div>`;
   const MARK = { new: ['triangle', '--up', '신규'], add: ['triangle', '--up', '확대'], reduce: ['triangle', '--down', '축소'], exit: ['triangle', '--down', '청산'] };
   const marks = rows.map((r, i) => r.action in MARK && r.price != null ? { coord: [i, r.price], action: r.action } : null).filter(Boolean);
   chart(row.querySelector('.chart'), {
     grid: { left: 64, right: 64, top: 28, bottom: 32 },
-    legend: { top: 0, right: 12, textStyle: { color: css('--text-2'), fontSize: 11 }, itemWidth: 12, itemHeight: 8, data: ['분기 말 가격', '보유 주식 수'] },
+    legend: legend({ top: 0, itemWidth: 12, itemHeight: 8, data: ['분기 말 가격', '보유 주식 수'] }),
     tooltip: tip({ trigger: 'axis', formatter: (ps) => { const r = rows[ps[0].dataIndex]; return `<b>${r.label}</b><br>가격 ${r.price != null ? fmtMoney(r.price) : '–'}<br>보유 ${r.shares == null ? '공시 없음' : fmtNum(r.shares) + '주'}${r.value ? ` · ${fmtUsd(r.value)}` : ''}${MARK[r.action] ? `<br>${MARK[r.action][2]}` : ''}`; } }),
     xAxis: { type: 'category', data: rows.map((r) => r.label), ...axis({ splitLine: { show: false } }) },
-    yAxis: [{ type: 'value', scale: true, ...axis(), axisLabel: { color: css('--text-2'), fontSize: 11, formatter: (v) => '$' + fmtNum(v) } },
+    yAxis: [valueAxis((v) => '$' + fmtNum(v), { scale: true }),
       { type: 'value', ...axis({ splitLine: { show: false } }), axisLabel: { color: css('--text-3'), fontSize: 11, formatter: (v) => fmtUsd(v).replace('$', '') } }],
     series: [
       { name: '보유 주식 수', type: 'bar', yAxisIndex: 1, barMaxWidth: 28, data: rows.map((r) => r.shares), itemStyle: { color: css('--s-other'), borderRadius: [2, 2, 0, 0] } },
@@ -631,7 +634,7 @@ function barChart(el, cats, vals, labels, color) {
     grid: { left: 48, right: 16, top: 32, bottom: 36 },
     tooltip: tip({ trigger: 'axis', axisPointer: { type: 'shadow' }, formatter: ([x]) => `${x.name}<br>비중 ${x.value.toFixed(1)}% · ${labels[x.dataIndex]}` }),
     xAxis: { type: 'category', data: cats, ...axis({ splitLine: { show: false } }) },
-    yAxis: { type: 'value', ...axis(), axisLabel: { color: css('--text-2'), fontSize: 11, formatter: '{value}%' } },
+    yAxis: valueAxis('{value}%'),
     series: [{ type: 'bar', data: vals.map((v) => +v.toFixed(2)), barMaxWidth: 44, itemStyle: { color, borderRadius: [3, 3, 0, 0] },
       label: { show: true, position: 'top', color: css('--text-2'), fontSize: 11, formatter: ({ dataIndex }) => labels[dataIndex] } }],
   });
@@ -665,7 +668,7 @@ function drawTreemap(longs, d) {
     tooltip: tip({
       formatter: ({ data: { p } }) => `<b>${esc(p.ticker || p.cusip)}</b>${p.kind ? ` ${p.kind}` : ''} · ${esc(p.name)}<br>비중 ${fmtPct(p.weight, 2)} · ${fmtUsd(p.value)}<br>` +
         (d.hasPrev ? `${ACTION[p.action]}${p.action === 'new' || p.changePct == null ? '' : ` ${p.changePct > 0 ? '+' : ''}${p.changePct.toFixed(1)}% (주식 수)`} · 직전 비중 ${fmtPct(p.prevWeight, 2)}` : '직전 분기 공시 없음') +
-        (p.hist ? `<br>분기 주가 ${arrow(p.hist.quarterPricePct) || '–'} · 연속 보유 ${p.hist.heldQuarters}${p.hist.heldSinceStart ? '+' : ''}분기${p.hist.sincePct != null ? ` · 보유 이후 ${arrow(p.hist.sincePct)}` : ''}` : ''),
+        (p.hist ? `<br>분기 주가 ${arrow(p.hist.quarterPricePct) || '–'} · 연속 보유 ${heldLabel(p.hist)}${p.hist.sincePct != null ? ` · 보유 이후 ${arrow(p.hist.sincePct)}` : ''}` : ''),
     }),
     series: [{
       type: 'treemap', data, roam: false, nodeClick: false, breadcrumb: { show: false }, top: 12, left: 12, right: 12, bottom: 12,
@@ -693,8 +696,8 @@ function drawDonut(longs) {
 // ───────────── 2. consensus ─────────────
 let minChange = 5;
 async function pageConsensus() {
-  const [d, funds] = await Promise.all([api(`/consensus?period=${state.period || ''}&minChange=${minChange}`), api(`/funds?period=${state.period || ''}`)]);
-  const names = Object.fromEntries(funds.funds.map((f) => [f.cik, f.name]));
+  const d = await api(`/consensus?period=${state.period || ''}&minChange=${minChange}`);
+  const names = Object.fromEntries([...d.funds, ...d.missing].map((f) => [f.cik, f.name]));
   if (!state.selection.length) { view.innerHTML = `<div class="card empty"><p>선택한 펀드가 없습니다.</p><a class="btn primary" href="#/funds">펀드 고르기</a></div>`; return; }
   const n = d.funds.length;
   view.innerHTML = `
@@ -778,7 +781,7 @@ async function pageResearch() {
   view.innerHTML = `
     <div class="head"><div><h1>리서치</h1><div class="sub">TradingAgents 의 분석가 4명 → 강세·약세 토론 → 트레이더 → 리스크 토론 → 포트폴리오 매니저가 5단계 등급을 냅니다</div></div>
       <div class="right"><input type="text" id="tickers" name="tickers" aria-label="리서치할 티커" placeholder="티커 직접 입력 (예: NVDA, AMZN…)" autocomplete="off" spellcheck="false" style="width:240px"><button class="btn primary" id="run">리서치</button></div></div>
-    <div class="note ${c.ready ? '' : 'warn'}" style="margin-bottom:12px">${c.ready ? `모델: <b>${esc(c.provider)}</b> · 심층 ${esc(c.deepModel)} · 빠른 ${esc(c.quickModel)} · 토론 ${c.debateRounds}회 / 리스크 ${c.riskRounds}회 · 한 번에 한 종목씩 순서대로 실행 · 같은 종목은 14일간 결과 재사용`
+    <div class="note ${c.ready ? '' : 'warn'}" style="margin-bottom:12px">${c.ready ? `모델: <b>${esc(c.provider)}</b> · 심층 ${esc(c.deepModel)} · 빠른 ${esc(c.quickModel)} · 토론 ${c.debateRounds}회 / 리스크 ${c.riskRounds}회 · 한 번에 한 종목씩 순서대로 실행 · 같은 종목은 ${c.freshDays}일간 결과 재사용`
       : '.env 에 RESEARCH_PROVIDER / RESEARCH_DEEP_MODEL / RESEARCH_QUICK_MODEL 과 해당 API 키를 설정하고 서버를 다시 시작하세요.'}</div>
     <div class="card"><div class="table-wrap"><table><thead><tr><th>종목</th><th>상태</th><th>등급</th><th>13F 근거</th><th>분석 기준일</th><th>완료</th><th></th></tr></thead><tbody>
     ${d.jobs.map((j) => `<tr class="${j.status === 'done' || j.reports ? 'click' : ''}" data-id="${j.id}" data-status="${j.status}">

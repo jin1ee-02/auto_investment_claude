@@ -88,6 +88,7 @@ def kv_get(key, default=None):
     return json.loads(r[0]) if r else default
 
 
-def kv_set(key, value):
-    conn().execute('INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+def kv_set(key, value, cursor=None):
+    """Store a JSON value. Pass `cursor` to write inside an open `tx()`."""
+    (cursor or conn()).execute('INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
                    (key, json.dumps(value, ensure_ascii=False)))

@@ -64,6 +64,13 @@ def get(job_id):
     return public(row, full=True) if row else None
 
 
+def latest_marks():
+    """Newest job per ticker (any status), for the badges next to tickers."""
+    return {r['ticker']: {'id': r['id'], 'status': r['status'], 'rating': r['rating']} for r in db.rows(
+        'SELECT r.id, r.ticker, r.status, r.rating FROM research r '
+        'JOIN (SELECT MAX(id) id FROM research GROUP BY ticker) m ON m.id = r.id')}
+
+
 def latest_by_ticker(fresh_days=FRESH_DAYS):
     """Newest finished, still-fresh research per ticker."""
     cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=fresh_days)).isoformat(timespec='seconds')
@@ -73,12 +80,12 @@ def latest_by_ticker(fresh_days=FRESH_DAYS):
     return out
 
 
-def enqueue(tickers, context=None, force=False):
-    """Queue tickers. Fresh finished research and already queued/running jobs are reused."""
+def enqueue(tickers, context=None, force=False, fresh_days=FRESH_DAYS):
+    """Queue tickers. Research finished within `fresh_days` and already queued/running jobs are reused."""
     rc = config.research_config()
     if not rc['ready']:
         raise ValueError('리서치 모델 설정이 없습니다 (.env 의 RESEARCH_* 와 API 키)')
-    fresh = {} if force else latest_by_ticker()
+    fresh = {} if force else latest_by_ticker(fresh_days)
     queued, reused, rejected = [], [], []
     for raw in tickers:
         ticker = (raw or '').strip().upper()
@@ -90,7 +97,7 @@ def enqueue(tickers, context=None, force=False):
             reused.append({'ticker': ticker, 'id': active['id'], 'reason': '이미 대기·진행 중'})
             continue
         if ticker in fresh:
-            reused.append({'ticker': ticker, 'id': fresh[ticker]['id'], 'reason': f'최근 {FRESH_DAYS}일 내 결과 재사용'})
+            reused.append({'ticker': ticker, 'id': fresh[ticker]['id'], 'reason': f'최근 {fresh_days}일 내 결과 재사용'})
             continue
         cur = db.run('INSERT INTO research(ticker,trade_date,status,stage,context,provider,deep_model,quick_model) '
                      "VALUES(?,?,'queued','대기',?,?,?,?)",
@@ -147,7 +154,8 @@ def _run(job):
     job_id = job['id']
     fd, out_path = tempfile.mkstemp(suffix='.json', prefix='research-')
     os.close(fd)
-    env = {**os.environ, 'PYTHONIOENCODING': 'utf-8', 'PYTHONUTF8': '1'}
+    # TradingAgents >=0.7 checks for a newer release on startup; the pinned version is deliberate.
+    env = {**os.environ, 'PYTHONIOENCODING': 'utf-8', 'PYTHONUTF8': '1', 'TRADINGAGENTS_NO_UPDATE_CHECK': '1'}
     with _lock:
         if db.one('SELECT status FROM research WHERE id=?', (job_id,))['status'] != 'queued':
             return

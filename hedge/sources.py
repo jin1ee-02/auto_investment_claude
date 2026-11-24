@@ -382,8 +382,13 @@ HISTORY_QUARTERS = 8     # two years: enough for performance and AUM history
 
 
 def refresh_fund(cik, quarters=HISTORY_QUARTERS, force=False):
-    """Fetch the newest `quarters` filings of one fund. Returns the periods stored."""
+    """Fetch the newest `quarters` filings of one fund.
+
+    Returns (periods stored, changed). `changed` is False when every filing was already
+    stored as is and the fund's name did not move, so cached analysis can be kept.
+    """
     cik = str(int(cik))
+    before = db.one('SELECT name FROM funds WHERE cik=?', (cik,))
     last_error = None
     for provider in providers():
         try:
@@ -393,7 +398,7 @@ def refresh_fund(cik, quarters=HISTORY_QUARTERS, force=False):
                 raise SourceError('13F-HR 공시가 없습니다')
             former = [f for old in funds_seed.PREDECESSORS.get(cik, ())
                       for f in pick_filings(provider.list_filings(old)[1], 99)]
-            stored = []
+            stored, wrote = [], False
             for filing in chosen:
                 # One period's table = the chosen filing + later "new holdings" amendments
                 # + what a predecessor filer reported for the same period.
@@ -407,14 +412,15 @@ def refresh_fund(cik, quarters=HISTORY_QUARTERS, force=False):
                 filing.accession = merged
                 store_filing(filing, rows)
                 stored.append(filing.period)
+                wrote = True
             with db.tx() as c:
                 c.execute('INSERT INTO funds(cik,name) VALUES(?,?) ON CONFLICT(cik) DO NOTHING', (cik, name or cik))
                 c.execute("UPDATE funds SET last_refresh=?, last_error=NULL, name=CASE WHEN featured=1 THEN name ELSE ? END "
                           'WHERE cik=?', (dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds'), name or cik, cik))
                 if name:
-                    c.execute('INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-                              (f'filer_name:{cik}', json.dumps(name)))
-            return stored
+                    db.kv_set(f'filer_name:{cik}', name, cursor=c)
+            after = db.one('SELECT name FROM funds WHERE cik=?', (cik,))
+            return stored, wrote or before is None or before['name'] != after['name']
         except SourceError as exc:
             last_error = exc
             continue

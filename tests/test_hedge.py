@@ -173,6 +173,41 @@ class AnalysisTest(Base):
         self.assertAlmostEqual(q[Q1]['priceEffect'], 2000 * 0.075)
         self.assertAlmostEqual(q[Q1]['priceEffect'] + q[Q1]['netFlow'], 2150 - 2000)
 
+    def test_fund_list_track_matches_history_chain(self):
+        q4 = '2025-12-31'
+        put('1', q4, [('AAA', 100, 1000), ('SPY', 10, 1000)])
+        put('1', Q1, [('AAA', 100, 1100), ('SPY', 10, 1050)])
+        put('1', Q2, [('AAA', 200, 2420), ('SPY', 10, 1155)])
+        h = analysis.fund_history('1')
+        q = {x['period']: x for x in h['quarters']}
+        self.assertEqual((q[q4]['chained'], q[Q1]['chained'], q[Q2]['chained']), (0, 1, 2))
+        self.assertEqual(h['firstLinked'], Q1)
+        early, late = analysis.track_record('1', Q1), analysis.track_record('1', Q2)
+        self.assertEqual((early['quarters'], late['quarters']), (1, 2))   # each view reads its own chain
+        self.assertAlmostEqual(early['cumPct'], q[Q1]['cumPct'])
+        self.assertAlmostEqual(late['cumPct'], h['cumPct'])
+        self.assertEqual(late['from'], '2025 Q4')
+
+    def test_cached_analysis_resets_on_invalidate(self):
+        put('1', Q1, [('AAA', 100, 1000)])
+        put('1', Q2, [('AAA', 100, 1000)])
+        self.assertEqual(analysis.fund_summary('1', Q2)['positions'], 1)
+        db.run("INSERT INTO holdings(cik,period,key,kind,ticker,cusip,name,cls,value,shares) "
+               "VALUES('1',?,'BBB','','BBB','','','',10,1)", (Q2,))
+        db.run("UPDATE filings SET positions=2 WHERE cik='1' AND period=?", (Q2,))
+        self.assertEqual(analysis.fund_summary('1', Q2)['positions'], 1)  # cached until told otherwise
+        analysis.invalidate()
+        self.assertEqual(analysis.fund_summary('1', Q2)['positions'], 2)
+        self.assertIsNone(analysis.fund_summary('nope', Q2))
+
+    def test_change_action_threshold(self):
+        self.assertEqual(analysis.change_action(100, 100.5, 1.0)[0], 'hold')    # under 1%: rebalancing
+        action, change = analysis.change_action(100, 102, 1.0)
+        self.assertEqual(action, 'add')
+        self.assertAlmostEqual(change, 2.0)
+        self.assertEqual(analysis.change_action(100, 90, 5.0)[0], 'reduce')
+        self.assertEqual(analysis.change_action(100, 97, 5.0)[0], 'hold')
+
     def test_position_history_streak_and_price(self):
         q3, q4 = '2025-09-30', '2025-12-31'
         put('1', q3, [('AAA', 100, 1000)])
