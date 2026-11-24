@@ -60,7 +60,7 @@ function giveUp() { off = true; playing = false; render(); }
 
 // The first click or key press anywhere lifts the browser's autoplay block.
 function firstGesture(e) {
-  if (e.target.closest?.('#player, .record')) return; // those controls decide for themselves
+  if (e.target.closest?.('#player')) return; // those controls decide for themselves
   if (ready && prefs.on && !playing) player.playVideo();
 }
 addEventListener('pointerdown', firstGesture, true);

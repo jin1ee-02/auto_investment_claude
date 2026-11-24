@@ -127,52 +127,6 @@ async function route() {
 }
 window.addEventListener('hashchange', route);
 
-// ───────────── sleeve record ─────────────
-// Every page's sleeve (.head) gets the record that is playing, slid halfway out. Pages re-render often,
-// so the angle comes from one clock rather than from the element: a fresh record picks up where the last one was.
-const RPM_MS = 1800; // 33⅓ rpm
-const spin = { ms: 0, since: null, anim: null };
-const stillMotion = matchMedia('(prefers-reduced-motion: reduce)');
-let unsleeved = false;
-function dressHead() {
-  const head = view.querySelector(':scope > .head');
-  if (!head) return;
-  const deck = document.createElement('div');
-  deck.className = unsleeved ? 'deck' : 'deck enter'; unsleeved = true;
-  head.before(deck); deck.append(head);
-  head.classList.toggle('long', (head.querySelector('h1')?.firstChild?.textContent || '').trim().length > 8);
-  deck.insertAdjacentHTML('beforeend', `<button class="record" type="button"><span class="disc"><svg viewBox="0 0 100 100" aria-hidden="true">
-    <circle cx="50" cy="50" r="50" fill="${css('--mark')}"/><circle cx="50" cy="50" r="46.5" fill="none" stroke="${css('--mark-ink')}" stroke-width=".6"/>
-    <path id="arc-top" d="M14 50a36 36 0 0 1 72 0" fill="none"/><path id="arc-bottom" d="M9 50a41 41 0 0 0 82 0" fill="none"/>
-    <text text-anchor="middle"><textPath id="rec-title" href="#arc-top" startOffset="50%"></textPath></text>
-    <text text-anchor="middle"><textPath id="rec-artist" href="#arc-bottom" startOffset="50%"></textPath></text>
-    <circle cx="50" cy="50" r="4.2" fill="${css('--bg')}"/></svg></span></button>`);
-  $('.record', deck).onclick = () => window.music?.toggle();
-  if (!stillMotion.matches) {
-    spin.anim = $('.disc', deck).animate({ transform: ['rotate(0turn)', 'rotate(1turn)'] }, { duration: RPM_MS, iterations: Infinity });
-    spin.anim.pause();
-  }
-  syncRecord();
-}
-function syncRecord() {
-  const m = window.music?.state() || { off: true }, now = performance.now();
-  if (m.playing && spin.since == null) spin.since = now;
-  if (!m.playing && spin.since != null) { spin.ms += now - spin.since; spin.since = null; }
-  const rec = $('.record');
-  if (!rec) return;
-  rec.disabled = !!m.off;
-  rec.setAttribute('aria-label', m.off ? '레코드' : m.playing ? `${m.title} 일시정지` : `${m.title} 재생`);
-  rec.title = m.off ? '' : m.playing ? '일시정지' : '재생';
-  $('#rec-title').textContent = m.off ? 'Hedge Insight' : m.title;
-  $('#rec-artist').textContent = m.off ? '13F' : m.artist;
-  if (spin.anim?.effect?.target?.isConnected) {
-    spin.anim.currentTime = (spin.ms + (spin.since == null ? 0 : now - spin.since)) % RPM_MS;
-    m.playing ? spin.anim.play() : spin.anim.pause();
-  }
-}
-new MutationObserver(dressHead).observe(view, { childList: true });
-document.addEventListener('music', syncRecord);
-
 async function saveSelection() {
   const r = await api('/selection', { method: 'PUT', body: { ciks: state.selection } });
   state.selection = r.selection;
